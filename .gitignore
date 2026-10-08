@@ -1,0 +1,51 @@
+# Personal configuration and credentials. Commit only documented examples.
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.key
+auth.json
+*.local.json
+*.local.yaml
+*.local.yml
+*.local.toml
+*.local.md
+*.local.conf
+compose.override.yaml
+compose.override.yml
+kindle/server.conf
+kindle/server.cache
+kindle/bootstrap-frame.png
+
+# Real quota data, logs, device backups, generated deployment bundles.
+/runtime/
+/build/
+/dist/
+/docs/local/
+*.log
+
+# Python environments and caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local tools, editors, and OS metadata.
+.codegraph/
+.codex/
+.agents/
+.idea/
+.vscode/
+.DS_Store
+._*
+Thumbs.db
+*.swp
+*.swo

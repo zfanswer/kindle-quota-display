@@ -1,0 +1,9 @@
+Kindle Quota Display
+Copyright 2026 Kindle Quota Display contributors
+
+This project is licensed under the Apache License, Version 2.0.
+
+CodexBar, FBInk, KindleModding, and remote-eink-dashboard are separate
+projects referenced as dependencies, documentation, or design inspiration.
+Their source code and binaries are not included in this repository.
+See docs/references/sources.md for attribution and upstream references.

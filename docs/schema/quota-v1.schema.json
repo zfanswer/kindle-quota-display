@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kindle Quota Snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "updated_at",
+    "providers"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "codex",
+        "claude"
+      ],
+      "properties": {
+        "codex": {
+          "$ref": "#/$defs/provider"
+        },
+        "claude": {
+          "$ref": "#/$defs/provider"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source",
+        "status",
+        "attempted_at",
+        "last_success_at",
+        "sampled_at",
+        "error_code",
+        "windows"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "CODEX",
+            "CLAUDE CODE"
+          ]
+        },
+        "source": {
+          "const": "oauth"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "attempted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_success_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "sampled_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "error_code": {
+          "enum": [
+            null,
+            "timeout",
+            "command_failed",
+            "invalid_payload",
+            "source_mismatch",
+            "cli_missing",
+            "output_limit"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/window"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "error_code": {
+                "type": "null"
+              },
+              "sampled_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "last_success_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "windows": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "error_code": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "used_percent",
+        "remaining_percent",
+        "window_minutes",
+        "reset_at"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "primary",
+            "secondary",
+            "tertiary"
+          ]
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "remaining_percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "window_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 525600
+        },
+        "reset_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

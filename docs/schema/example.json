@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-10-07T12:00:00Z",
+  "providers": {
+    "codex": {
+      "name": "CODEX",
+      "source": "oauth",
+      "status": "ok",
+      "attempted_at": "2026-10-07T12:00:00Z",
+      "last_success_at": "2026-10-07T12:00:00Z",
+      "sampled_at": "2026-10-07T11:59:00Z",
+      "error_code": null,
+      "windows": [
+        {
+          "id": "primary",
+          "used_percent": 42.0,
+          "remaining_percent": 58.0,
+          "window_minutes": 300,
+          "reset_at": "2026-10-07T14:31:00Z"
+        },
+        {
+          "id": "secondary",
+          "used_percent": 63.0,
+          "remaining_percent": 37.0,
+          "window_minutes": 10080,
+          "reset_at": "2026-10-10T10:00:00Z"
+        }
+      ]
+    },
+    "claude": {
+      "name": "CLAUDE CODE",
+      "source": "oauth",
+      "status": "ok",
+      "attempted_at": "2026-10-07T12:00:00Z",
+      "last_success_at": "2026-10-07T12:00:00Z",
+      "sampled_at": "2026-10-07T11:59:20Z",
+      "error_code": null,
+      "windows": [
+        {
+          "id": "primary",
+          "used_percent": 28.0,
+          "remaining_percent": 72.0,
+          "window_minutes": 300,
+          "reset_at": "2026-10-07T13:17:00Z"
+        },
+        {
+          "id": "secondary",
+          "used_percent": 51.0,
+          "remaining_percent": 49.0,
+          "window_minutes": 10080,
+          "reset_at": "2026-10-12T01:00:00Z"
+        }
+      ]
+    }
+  }
+}

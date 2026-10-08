@@ -1,0 +1,5 @@
+{
+  "providers": ["codex", "claude"],
+  "source": "oauth",
+  "timeout_seconds": 30
+}

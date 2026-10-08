@@ -1,0 +1,11 @@
+# Parsed as data, never sourced as shell code. No quotes or inline comments.
+SERVER_IP=
+SERVER_HOST=MacBook.local
+PORT=8486
+SERVER_ID=kqd-pw3
+ENABLE_SCAN=1
+INTERVAL=180
+FULL_REFRESH=1800
+FBINK=/mnt/us/libkh/bin/fbink
+# Enable only after manual refresh + recovery checks on the PW3.
+ALLOW_SUSPEND=0
