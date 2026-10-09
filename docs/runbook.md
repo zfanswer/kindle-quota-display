@@ -97,7 +97,7 @@ python scripts/prepare.py kindle \
 
 检查eink-dashboard/server.conf中的FBINK路径、端口/身份、间隔、FULL_REFRESH和休眠开关。默认FBINK为/mnt/us/libkh/bin/fbink。生成器拒绝覆盖现有包，重建时使用新目录。
 
-包内通常有四个内部脚本、配置和五个Library入口；无需附带启动PNG，首次自检会真实联网取图。旧版设备上的bootstrap-frame.png不再读取，不要求删除它；联网或PNG校验失败时不重绘旧安装快照。manifest.json只列部署文件及SHA256，不复制到设备。
+包内有四个内部脚本、配置、五个Library入口及固定bootstrap-frame.png，manifest包含占位图SHA256。占位图仅显示“正在刷新quota信息”，无有效缓存时使用；旧版同名额度快照缺少标记会被忽略。更新时将固定图和脚本一起部署，不能只复制旧额度截图作为占位图。
 
 **安装钩子可能在首次索引入口后自动自检并启用RTC循环。** 点击主入口也会自检后将ALLOW_SUSPEND改为1；不要把模板中的0理解为正常启动后一定不休眠。事先确认RTC/sysfs能力、无其他dashboard占用alarm，以及停止方法。
 
@@ -123,7 +123,7 @@ python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/
 ## 7. 绘图、自动循环与停止
 
 - 点击“刷新 Agent 额度”做单次刷新；已有循环持锁时拒绝并发，先停止再测试。
-- 点击“开启Agent额度”自检并启动（如果安装钩子已启动，不重复建立进程）。
+- 点击“开启Agent额度”先显示最近成功缓存，无有效缓存时显示固定刷新占位，再自检并启动；已有循环只恢复画面。占位图不含额度/时间，不作为成功数据缓存；坏缓存或占位图不阻塞联网。
 - 观察frame_ok、suspend_armed、resumed、再次frame_ok；肉眼核对方向、中文、数据和残影。
 - 点击“停止 Agent 额度”退出，确认Wi-Fi/屏保恢复并可正常阅读；电源键提前唤醒也可能按规则退出。
 

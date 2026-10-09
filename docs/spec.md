@@ -53,13 +53,14 @@ stage为bootstrap、preflight_failed、frame_ok、refresh_failed、suspend_armed
 
 - 配置逐项解析为数据，不source/eval配置；未知/重复key拒绝。
 - probe严格核验协议和SERVER_ID；发现不扩大实际CIDR，不扫描公网或/21及更大网段。
-- 单实例锁保护绘图与run。新PNG校验、FBInk解码成功后才提交缓存；失败保留旧画面。
-- 启动自检不得预先重绘安装时的PNG；不使用遗留bootstrap-frame.png，也不在首次下载失败时覆盖当前较新的画面。
-- start启动后台run，refresh只做一轮，stop核验PID归属后请求退出，status只读。
+- 单实例锁保护run/refresh，独立display-lock保护绘图与缓存提交；新PNG校验、FBInk解码成功后才原子提交frame.png，提交前不允许预览重绘旧缓存。
+- 启动入口先通过show-cache显示最近成功的frame.png，再自检。show-cache无网络/RTC/进程状态修改，不改变缓存、成功轮次或全屏刷新时间；绘图繁忙时跳过占位。
+- 缓存缺失、无效或解码失败时显示固定bootstrap-frame.png，保留标题和两张Provider卡片，卡片提示“正在刷新quota信息”；必须有refresh-v1占位标记，遗留额度快照忽略。占位图不提交为frame.png、不表示额度数据；真实刷新继续，失败时保留缓存或占位画面。/tmp缓存不保证跨重启。
+- start启动后台run，refresh只做一轮，show-cache按“成功缓存→固定占位图”显示，stop核验PID归属后请求退出，status只读。
 - RTC选择可写且未占用的rtc0/rtc1；相对alarm不支持时尝试硬件epoch，不比较硬件与系统绝对epoch来判断早醒。
 - 省电循环关闭无线、mem休眠、唤醒后开启无线等8秒；经过时间少于INTERVAL-30时按提前唤醒退出。
 - cleanup恢复开始时的无线/屏保，清理自身alarm/PID/锁；不覆盖他人alarm、不删除活动锁。
-- bootstrap先检查活动循环，再真实自检；通过后启用RTC。恢复入口是临时文件，成功两次绘图后删除。
+- bootstrap先尝试显示成功缓存，再检查活动循环；已有任务时直接返回，不重复启动；否则真实自检，通过后启用RTC。恢复入口是临时文件，成功两次绘图后删除。
 
 ## 验收边界
 

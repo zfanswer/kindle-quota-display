@@ -64,6 +64,54 @@ esac""")
     def tearDown(self):
         self.tmp.cleanup()
 
+    def placeholder(self):
+        shutil.copyfile(ROOT / "kindle/assets/bootstrap-frame.png", self.base / "bootstrap-frame.png")
+
+    def test_valid_cache_has_priority_over_fixed_placeholder(self):
+        self.placeholder()
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
+        result = self.run_script("quota-dashboard.sh", "show-cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().strip(), f"fbink -q -i {self.state}/frame.png")
+
+    def test_missing_cache_offline_shows_fixed_placeholder_before_wifi(self):
+        self.placeholder()
+        self.command("curl", "exit 1")
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("ENABLE_SCAN=1", "ENABLE_SCAN=0"))
+        result = self.run_script("bootstrap.sh")
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text()
+        paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.base}/bootstrap-frame.png"])
+        self.assertLess(calls.index("fbink"), calls.index("wirelessEnable 1"))
+        self.assertFalse((self.state / "frame.png").exists(), "Placeholder must not become a quota cache")
+
+    def test_invalid_cache_shows_placeholder_then_live_frame(self):
+        self.placeholder()
+        (self.state / "frame.png").write_bytes(b"bad cache")
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        self.run_script("bootstrap.sh")
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.base}/bootstrap-frame.png",
+                                  f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+
+    def test_cache_decode_failure_uses_placeholder_then_live_frame(self):
+        self.placeholder()
+        (self.state / "frame.png").write_bytes(frame(None, NOW))
+        self.command("fbink", '''printf "fbink %s\\n" "$*" >> "$MOCK_LOG"
+case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        self.run_script("bootstrap.sh")
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png",
+                                  f"fbink -q -i {self.base}/bootstrap-frame.png",
+                                  f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+
     def test_cached_server_and_identity(self):
         (self.base / "server.cache").write_text("192.168.1.9\n")
         result = self.run_script("find-server.sh", "--internal")
@@ -165,7 +213,7 @@ exit 1''')
         self.assertNotEqual(self.run_script("quota-dashboard.sh", "refresh").returncode, 0)
         self.assertFalse(self.log.exists())
 
-    def test_bootstrap_offline_does_not_repaint_installation_frame(self):
+    def test_bootstrap_offline_shows_latest_cache_before_wifi(self):
         # A newer good frame exists while the installation snapshot is stale.
         last_good = self.png.read_bytes()
         (self.state / "frame.png").write_bytes(last_good)
@@ -176,7 +224,10 @@ exit 1''')
         result = self.run_script("bootstrap.sh")
         self.assertNotEqual(result.returncode, 0)
         calls = self.log.read_text() if self.log.exists() else ""
-        self.assertNotIn("fbink", calls, "Offline restart repaints stale installation PNG")
+        paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png"])
+        self.assertLess(calls.index("fbink"), calls.index("wirelessEnable 1"))
+        self.assertNotIn("bootstrap-frame.png", calls)
         self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
 
     def test_bootstrap_only_paints_live_download_before_rtc_preflight(self):
@@ -198,8 +249,105 @@ exit 1''')
         result = self.run_script("bootstrap.sh")
         self.assertNotEqual(result.returncode, 0)
         calls = self.log.read_text() if self.log.exists() else ""
-        self.assertNotIn("fbink", calls)
+        paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png"])
         self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
+
+    def test_bootstrap_shows_cache_then_live_frame(self):
+        (self.state / "frame.png").write_bytes(frame(None, NOW))
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        self.run_script("bootstrap.sh")
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png",
+                                  f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+
+    def test_show_cache_preserves_running_process_state(self):
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
+        (self.state / "lock").mkdir()
+        (self.state / "pid").write_text("123\n")
+        (self.state / "status").write_text("frame_ok\n")
+        (self.state / "full-refresh").write_text("1234\n")
+        result = self.run_script("quota-dashboard.sh", "show-cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().strip(), f"fbink -q -i {self.state}/frame.png")
+        self.assertTrue((self.state / "lock").is_dir())
+        self.assertEqual((self.state / "pid").read_text(), "123\n")
+        self.assertEqual((self.state / "status").read_text(), "frame_ok\n")
+        self.assertEqual((self.state / "full-refresh").read_text(), "1234\n")
+        self.assertFalse((self.state / "display-lock").exists())
+
+    def test_show_cache_skips_busy_display_without_removing_its_lock(self):
+        self.placeholder()
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
+        (self.state / "display-lock").mkdir()
+        result = self.run_script("quota-dashboard.sh", "show-cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertTrue((self.state / "display-lock").is_dir())
+
+    def test_bootstrap_already_running_still_shows_cache(self):
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
+        script = self.base / "quota-dashboard.sh"
+        shutil.copyfile(script, self.base / "quota-dashboard-real.sh")
+        (self.base / "quota-dashboard-real.sh").chmod(0o755)
+        script.write_text('''#!/bin/sh
+case "$1" in
+ status) printf 'running pid=123\\nframe_ok\\n';;
+ *) exec "$KQD_BASE/quota-dashboard-real.sh" "$@";;
+esac
+''')
+        (self.state / "lock").mkdir()
+        result = self.run_script("bootstrap.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().strip(), f"fbink -q -i {self.state}/frame.png")
+        self.assertTrue((self.state / "lock").is_dir())
+
+    def test_bootstrap_invalid_cache_still_fetches_live_frame(self):
+        (self.state / "frame.png").write_bytes(b"bad cache")
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        self.run_script("bootstrap.sh")
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+
+    def test_bootstrap_cache_decode_failure_still_fetches_live_frame(self):
+        (self.state / "frame.png").write_bytes(frame(None, NOW))
+        self.command("fbink", '''printf "fbink %s\\n" "$*" >> "$MOCK_LOG"
+case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        self.run_script("bootstrap.sh")
+        self.assertIn(f"fbink -q -f -i {self.state}/frame.next.png", self.log.read_text())
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+        self.assertFalse((self.state / "display-lock").exists())
+
+    def test_cache_preview_cannot_repaint_old_frame_during_promotion(self):
+        (self.state / "frame.png").write_bytes(frame(None, NOW))
+        # Interleave a preview exactly after drawing the new frame but before
+        # committing its cache; it must skip rather than redraw the old cache.
+        self.command("mv", '''if [ "$2" = "$KQD_STATE/frame.png" ]; then
+ "$KQD_BASE/quota-dashboard.sh" show-cache || exit 1
+fi
+exec /bin/mv "$@"''')
+        result = self.run_script("quota-dashboard.sh", "refresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+        self.assertFalse((self.state / "display-lock").exists())
+
+    def test_bootstrap_missing_cache_offline_never_uses_install_frame(self):
+        (self.base / "bootstrap-frame.png").write_bytes(self.png.read_bytes())
+        self.command("curl", "exit 1")
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("ENABLE_SCAN=1", "ENABLE_SCAN=0"))
+        result = self.run_script("bootstrap.sh")
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("fbink", calls)
 
     def test_debug_run_restores_initial_wifi_and_screensaver(self):
         (self.state / "lock").mkdir()

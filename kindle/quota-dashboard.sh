@@ -8,6 +8,18 @@ ACTION=${1:-start}
 WAIT_PID=
 CYCLES=0
 STOP_REASON=none
+DISPLAY_OWNED=0
+
+acquire_display() {
+    mkdir "$STATE/display-lock" 2>/dev/null || return 1
+    DISPLAY_OWNED=1
+}
+release_display() {
+    if [ "$DISPLAY_OWNED" -eq 1 ]; then
+        rmdir "$STATE/display-lock" 2>/dev/null || true
+        DISPLAY_OWNED=0
+    fi
+}
 
 pause() {
     sleep "$1" &
@@ -21,19 +33,24 @@ refresh() {
     next=$STATE/frame.next.png
     fetch "http://$server:$PORT/frame/kindle1.png" "$next" 15 || { rm -f "$next"; return 1; }
     valid_png "$next" || { rm -f "$next"; return 1; }
+    acquire_display || { rm -f "$next"; return 1; }
     now=$(date +%s); last=0
     [ ! -f "$STATE/full-refresh" ] || last=$(cat "$STATE/full-refresh")
     case "$last" in ''|*[!0-9]*) last=0;; esac
     # FBInk decodes before displaying. Never clear the screen before decoding a successful fetch.
     if [ "$((now - last))" -ge "$FULL_REFRESH" ] || [ "$now" -lt "$last" ]; then
-        "$FBINK" -q -f -i "$next" || { rm -f "$next"; return 1; }
-        printf '%s\n' "$now" > "$STATE/full-refresh"
+        "$FBINK" -q -f -i "$next" || { release_display; rm -f "$next"; return 1; }
+        printf '%s\n' "$now" > "$STATE/full-refresh" || { release_display; rm -f "$next"; return 1; }
     else
-        "$FBINK" -q -i "$next" || { rm -f "$next"; return 1; }
+        "$FBINK" -q -i "$next" || { release_display; rm -f "$next"; return 1; }
     fi
-    mv "$next" "$STATE/frame.png"
+    # Keep drawing and cache promotion in one transaction: a concurrent preview
+    # must never repaint the old cache after a new frame has reached the screen.
+    mv "$next" "$STATE/frame.png" || { release_display; rm -f "$next"; return 1; }
+    release_display
 }
 cleanup() {
+    release_display
     if [ -n "$WAIT_PID" ]; then kill "$WAIT_PID" 2>/dev/null || true; wait "$WAIT_PID" 2>/dev/null || true; fi
     [ "${ALARM_OWNED:-0}" -eq 0 ] || printf '0\n' > "$RTC" || true
     case "${SCREENSAVER_PREVIOUS:-}" in 0|1) lipc-set-prop com.lab126.powerd preventScreenSaver "$SCREENSAVER_PREVIOUS" >/dev/null 2>&1 || true;; esac
@@ -61,6 +78,21 @@ owned_pid() {
 }
 mkdir -p "$STATE"
 case "$ACTION" in
+    show-cache)
+        # This operation never touches the worker lock/PID, Wi-Fi, or RTC.
+        # Prefer the successful quota cache; otherwise show the fixed message.
+        # A busy display or missing/bad images never blocks the live fetch.
+        trap release_display 0
+        trap 'exit 1' 1 2 15
+        acquire_display || exit 0
+        [ -x "$FBINK" ] || exit 1
+        if valid_png "$STATE/frame.png" && "$FBINK" -q -i "$STATE/frame.png"; then
+            exit 0
+        fi
+        if valid_placeholder "$BASE/bootstrap-frame.png"; then
+            "$FBINK" -q -i "$BASE/bootstrap-frame.png"
+        fi
+        ;;
     start)
         [ -x "$FBINK" ] || { echo 'FBInk missing' >&2; exit 1; }
         if ! mkdir "$STATE/lock" 2>/dev/null; then
@@ -129,5 +161,5 @@ case "$ACTION" in
         if owned_pid; then printf 'running pid=%s\n' "$pid"; else printf 'not running\n'; fi
         [ ! -f "$STATE/status" ] || cat "$STATE/status"
         ;;
-    *) echo 'Usage: quota-dashboard.sh {start|refresh|stop|status}' >&2; exit 2;;
+    *) echo 'Usage: quota-dashboard.sh {start|refresh|show-cache|stop|status}' >&2; exit 2;;
 esac

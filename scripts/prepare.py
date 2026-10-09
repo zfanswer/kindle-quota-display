@@ -45,6 +45,7 @@ def bundle(server, host, server_id, output):
     for name in ("common.sh", "find-server.sh", "quota-dashboard.sh", "bootstrap.sh"):
         shutil.copyfile(ROOT / "kindle" / name, app / name)
         (app / name).chmod(0o755)
+    shutil.copyfile(ROOT / "kindle/assets/bootstrap-frame.png", app / "bootstrap-frame.png")
     config = (ROOT / "kindle/server.conf.example").read_text()
     config = config.replace("SERVER_IP=\n", f"SERVER_IP={server}\n").replace("SERVER_HOST=MacBook.local", f"SERVER_HOST={host}")
     config = config.replace("SERVER_ID=kqd-pw3", f"SERVER_ID={server_id}")

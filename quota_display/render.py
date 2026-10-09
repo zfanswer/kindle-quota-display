@@ -6,12 +6,17 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
 from .collector import read_snapshot
 from .model import PROVIDERS, timestamp, utcnow
 
 WIDTH, HEIGHT = 1072, 1448
+
+
+def placeholder_frame():
+    """Fixed, account-free startup image. Marker distinguishes legacy quota PNGs."""
+    return frame(None, _refreshing=True)
 
 
 @lru_cache(maxsize=32)
@@ -47,7 +52,9 @@ def label(w):
     return {"primary": "当前会话", "secondary": "第二窗口", "tertiary": "第三窗口"}[w["id"]]
 
 
-def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600):
+def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600, *, _refreshing=False):
+    if _refreshing and data is not None:
+        raise ValueError("Startup placeholder cannot contain quota data")
     now = now or utcnow()
     zone = ZoneInfo(tz)
     img = Image.new("L", (WIDTH, HEIGHT), 255)
@@ -71,7 +78,9 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600):
         p = data["providers"][pid] if data else None
         title = {"codex": "Codex", "claude": "Claude Code"}.get(pid, name)
         text(left, y + 32, title, 44, True)
-        if not p or not p["sampled_at"]:
+        if _refreshing:
+            state = "刷新中"
+        elif not p or not p["sampled_at"]:
             state = "暂无数据"
         else:
             sample_age = (now - timestamp(p["sampled_at"])).total_seconds()
@@ -84,7 +93,9 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600):
             else:
                 state = "正常"
         text(right, y + 44, state, 26, True, True)
-        if p and p["sampled_at"]:
+        if _refreshing:
+            updated = "等待最新额度数据"
+        elif p and p["sampled_at"]:
             sample = timestamp(p["sampled_at"]).astimezone(zone)
             updated = "数据更新 " + sample.strftime("%Y-%m-%d %H:%M")
         else:
@@ -93,8 +104,8 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600):
         draw.line((left, y + 140, right, y + 140), fill=170, width=1)
         windows = p["windows"] if p else []
         if not windows:
-            text(left, y + 238, "暂无额度数据", 36)
-            text(left, y + 300, "等待首次成功采集", 26, fill=85)
+            text(left, y + 238, "正在刷新quota信息" if _refreshing else "暂无额度数据", 36)
+            text(left, y + 300, "请稍候" if _refreshing else "等待首次成功采集", 26, fill=85)
         row_pitch = (card_height - 168 - 32) // max(1, len(windows))
         if windows and row_pitch < 110:
             raise ValueError("Provider/window count exceeds the PW3 single-frame layout")
@@ -124,18 +135,27 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600):
     # 16 shades, no alpha; PNG decoder on Kindle does not need transparency.
     img = img.point(lambda p: round(p / 17) * 17)
     output = io.BytesIO()
-    img.save(output, "PNG", optimize=True)
+    info = None
+    if _refreshing:
+        info = PngImagePlugin.PngInfo()
+        info.add_text("kqd-placeholder", "refresh-v1")
+    img.save(output, "PNG", optimize=True, pnginfo=info)
     return output.getvalue()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", type=Path)
+    source.add_argument("--placeholder", action="store_true", help="fixed startup message, no quota input")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--now", help="fixed ISO timestamp for reproducible offline previews")
     args = parser.parse_args()
+    if args.placeholder and args.now:
+        parser.error("--placeholder does not accept timestamps")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(frame(read_snapshot(args.input), timestamp(args.now) if args.now else utcnow()))
+    args.output.write_bytes(placeholder_frame() if args.placeholder else
+                           frame(read_snapshot(args.input), timestamp(args.now) if args.now else utcnow()))
 
 
 if __name__ == "__main__":

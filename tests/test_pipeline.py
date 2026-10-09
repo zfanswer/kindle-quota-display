@@ -1,11 +1,13 @@
 import copy
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,7 +18,7 @@ from PIL import Image
 
 from quota_display.collector import CollectionError, atomic_write, collect, read_snapshot, run_cli
 from quota_display.model import PayloadError, normalize, timestamp, validate_snapshot
-from quota_display.render import frame
+from quota_display.render import frame, placeholder_frame
 from quota_display.server import Dashboard, handler
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,28 @@ def good():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_fixed_placeholder_png_contract(self):
+        data = placeholder_frame()
+        image = Image.open(io.BytesIO(data))
+        self.assertEqual(image.size, (1072, 1448))
+        self.assertEqual(image.mode, "L")
+        self.assertLessEqual(len(image.getcolors(maxcolors=256)), 16)
+        self.assertEqual(image.info, {"kqd-placeholder": "refresh-v1"})
+        marker = b"kqd-placeholder\x00refresh-v1"
+        self.assertEqual(data[33:67], len(marker).to_bytes(4, "big") + b"tEXt" + marker)
+
+    def test_prepared_bundle_includes_fixed_placeholder(self):
+        (ROOT / "build").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+            bundle = Path(tmp) / "bundle"
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/prepare.py"), "kindle",
+                                     "--host", "", "--output", str(bundle)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            asset = (ROOT / "kindle/assets/bootstrap-frame.png").read_bytes()
+            self.assertEqual((bundle / "eink-dashboard/bootstrap-frame.png").read_bytes(), asset)
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(manifest["eink-dashboard/bootstrap-frame.png"], hashlib.sha256(asset).hexdigest())
+
     def test_percentage_and_reset_mapping(self):
         p = normalize(fixture("codex"), "codex", NOW)
         self.assertEqual(p["windows"][0]["remaining_percent"], 58)

@@ -2,13 +2,15 @@
 set -eu
 BASE=${KQD_BASE:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 . "$BASE/common.sh"
+# Cover the Library immediately with the latest successfully committed frame,
+# even when the worker is already running; use the fixed message if no cache.
+"$BASE/quota-dashboard.sh" show-cache || true
 active=$("$BASE/quota-dashboard.sh" status)
 case "$active" in 'running pid='*) exit 0;; esac
 report bootstrap
 [ -x "$FBINK" ] || { report preflight_failed fbink_missing; exit 1; }
-# Preserve the current screen until a live fetch has validated and decoded.
-# Legacy bootstrap-frame.png is an installation snapshot, never a latest-frame
-# cache; repainting it on restart can replace a newer frame with stale data.
+# Preserve the cached preview until a live fetch has validated and decoded.
+# bootstrap-frame.png is a fixed message, never a quota cache or old snapshot.
 # Perform a real manual fetch/decode and verify that cleanup restores state first.
 original_wifi=$(lipc-get-prop com.lab126.cmd wirelessEnable 2>/dev/null) || original_wifi=$(lipc-get-prop com.lab126.wifid enable 2>/dev/null) || { report preflight_failed wifi_state_unknown; exit 1; }
 original_saver=$(lipc-get-prop com.lab126.powerd preventScreenSaver 2>/dev/null) || { report preflight_failed screensaver_unknown; exit 1; }

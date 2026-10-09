@@ -69,6 +69,13 @@ valid_png() {
     # PNG, 13-byte IHDR, 1072 x 1448, 8-bit grayscale (L), no alpha.
     [ "$header" = '89504e470d0a1a0a0000000d4948445200000430000005a80800' ]
 }
+valid_placeholder() {
+    valid_png "$1" || return 1
+    # Canonical tEXt chunk directly after IHDR: kqd-placeholder=refresh-v1.
+    # A legacy quota snapshot at the same filename has no marker and is skipped.
+    marker=$(dd if="$1" bs=1 skip=33 count=34 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ "$marker" = '0000001a744558746b71642d706c616365686f6c64657200726566726573682d7631' ]
+}
 wifi_begin() {
     WIFI_PREVIOUS=$(lipc-get-prop com.lab126.cmd wirelessEnable 2>/dev/null) || WIFI_PREVIOUS=$(lipc-get-prop com.lab126.wifid enable 2>/dev/null) || return 1
     case "$WIFI_PREVIOUS" in 0|1) ;; *) return 1;; esac

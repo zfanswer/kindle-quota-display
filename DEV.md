@@ -85,7 +85,9 @@ python scripts/render-previews.py
 - 省电模式每轮关闭无线、RTC 休眠、唤醒再开无线；目前联网等待为固定 8 秒，尚无关联/IP 就绪判断。
 - 其他进程占用 wakealarm 时不能覆盖；RTC 设备/epoch 支持按实际驱动核验。
 - 临时恢复入口成功绘图两次后删除；Library 重新索引可能滞后。正常操作用四个永久入口。
-- 启动不重绘遗留bootstrap-frame.png；它是安装快照，正常刷新只提交临时frame.png。离线启动或校验失败不能使显示退回安装时的旧图。
+- 启动先显示最近成功frame.png，无有效缓存则显示固定“正在刷新quota信息”，再联网；已有worker也可恢复画面。show-cache不改Wi-Fi/RTC/进程状态，占位不提交为真实缓存；/tmp不保证跨重启。
+- 固定资产在kindle/assets/bootstrap-frame.png，部署到同名设备路径；refresh-v1标记使旧版额度快照被忽略。可用`python -m quota_display.render --placeholder --output kindle/assets/bootstrap-frame.png`重建，不接受quota输入或时间参数。
+- 绘图与成功缓存提交由同一display-lock保护，预览不能在新图绘制与提交之间重绘旧图；生命周期锁与绘图锁各司其职。
 - 发现限制实际私有 `/22` 至 `/30`；SERVER_ID 是身份标记而非认证。
 
 ## 二开方向与验证要求

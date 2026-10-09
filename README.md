@@ -85,7 +85,7 @@ python scripts/prepare.py kindle \
 
 核对包内 `server.conf` 的 FBInk 路径，默认 `/mnt/us/libkh/bin/fbink`。备份、USB 安装、安全推出和首次启动按[安装手顺](docs/runbook.md)执行。点击“开启Agent额度”会真实自检并启用 RTC 省电循环；请先确认设备的 RTC/休眠能力。
 
-启动自检不重绘安装时的旧PNG，只在当前联网下载、校验并解码成功后更新画面。离线启动失败时保留现有画面；旧版遗留的 `bootstrap-frame.png` 不再使用。
+点击入口优先显示最近一次成功刷新的 PNG 缓存，遮住 Library，再联网自检并获取新图；没有有效缓存时显示固定的[“正在刷新quota信息”占位图](kindle/assets/bootstrap-frame.png)。已有任务时只恢复画面，不重复启动。缓存位于设备 `/tmp`，正常停止保留，设备重启后可能清除；安装快照不会作为占位图使用。
 
 Kindle 上四个日常入口是 **开启Agent额度 / 刷新 Agent 额度 / 重找额度服务器 / 停止 Agent 额度**。包内另有临时恢复自检入口，详细职责见[脚本说明](docs/kindle-scripts.md)。
 
