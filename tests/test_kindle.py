@@ -21,7 +21,7 @@ class KindleTests(unittest.TestCase):
         self.bin.mkdir()
         self.state = Path(self.tmp.name) / "state"
         self.state.mkdir()
-        for name in ("common.sh", "find-server.sh", "quota-dashboard.sh"):
+        for name in ("common.sh", "find-server.sh", "quota-dashboard.sh", "bootstrap.sh"):
             shutil.copyfile(ROOT / "kindle" / name, self.base / name)
             (self.base / name).chmod(0o755)
         self.png = Path(self.tmp.name) / "source.png"
@@ -164,6 +164,42 @@ exit 1''')
         (self.state / "lock").mkdir()
         self.assertNotEqual(self.run_script("quota-dashboard.sh", "refresh").returncode, 0)
         self.assertFalse(self.log.exists())
+
+    def test_bootstrap_offline_does_not_repaint_installation_frame(self):
+        # A newer good frame exists while the installation snapshot is stale.
+        last_good = self.png.read_bytes()
+        (self.state / "frame.png").write_bytes(last_good)
+        (self.base / "bootstrap-frame.png").write_bytes(frame(None, NOW))
+        self.command("curl", "exit 1")
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("ENABLE_SCAN=1", "ENABLE_SCAN=0"))
+        result = self.run_script("bootstrap.sh")
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("fbink", calls, "Offline restart repaints stale installation PNG")
+        self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
+
+    def test_bootstrap_only_paints_live_download_before_rtc_preflight(self):
+        (self.base / "bootstrap-frame.png").write_bytes(frame(None, NOW))
+        # Stop after real refresh, without accessing any host power/RTC path.
+        script = self.base / "bootstrap.sh"
+        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+        result = self.run_script("bootstrap.sh")
+        self.assertNotEqual(result.returncode, 0)  # Fake device has no suspend capability.
+        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
+        self.assertEqual(paints, [f"fbink -q -f -i {self.state}/frame.next.png"])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+
+    def test_bootstrap_invalid_download_keeps_last_frame(self):
+        last_good = self.png.read_bytes()
+        (self.state / "frame.png").write_bytes(last_good)
+        (self.base / "bootstrap-frame.png").write_bytes(frame(None, NOW))
+        self.png.write_bytes(b"<html>bad frame</html>" * 3)
+        result = self.run_script("bootstrap.sh")
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("fbink", calls)
+        self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
 
     def test_debug_run_restores_initial_wifi_and_screensaver(self):
         (self.state / "lock").mkdir()

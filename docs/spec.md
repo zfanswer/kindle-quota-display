@@ -54,6 +54,7 @@ stage为bootstrap、preflight_failed、frame_ok、refresh_failed、suspend_armed
 - 配置逐项解析为数据，不source/eval配置；未知/重复key拒绝。
 - probe严格核验协议和SERVER_ID；发现不扩大实际CIDR，不扫描公网或/21及更大网段。
 - 单实例锁保护绘图与run。新PNG校验、FBInk解码成功后才提交缓存；失败保留旧画面。
+- 启动自检不得预先重绘安装时的PNG；不使用遗留bootstrap-frame.png，也不在首次下载失败时覆盖当前较新的画面。
 - start启动后台run，refresh只做一轮，stop核验PID归属后请求退出，status只读。
 - RTC选择可写且未占用的rtc0/rtc1；相对alarm不支持时尝试硬件epoch，不比较硬件与系统绝对epoch来判断早醒。
 - 省电循环关闭无线、mem休眠、唤醒后开启无线等8秒；经过时间少于INTERVAL-30时按提前唤醒退出。

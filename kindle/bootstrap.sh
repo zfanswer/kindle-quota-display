@@ -6,10 +6,9 @@ active=$("$BASE/quota-dashboard.sh" status)
 case "$active" in 'running pid='*) exit 0;; esac
 report bootstrap
 [ -x "$FBINK" ] || { report preflight_failed fbink_missing; exit 1; }
-# A fresh, real-data bootstrap image is bundled by the installer, never a mock quota image.
-if [ -f "$BASE/bootstrap-frame.png" ] && valid_png "$BASE/bootstrap-frame.png"; then
-    "$FBINK" -q -f -i "$BASE/bootstrap-frame.png" || { report preflight_failed display_failed; exit 1; }
-fi
+# Preserve the current screen until a live fetch has validated and decoded.
+# Legacy bootstrap-frame.png is an installation snapshot, never a latest-frame
+# cache; repainting it on restart can replace a newer frame with stale data.
 # Perform a real manual fetch/decode and verify that cleanup restores state first.
 original_wifi=$(lipc-get-prop com.lab126.cmd wirelessEnable 2>/dev/null) || original_wifi=$(lipc-get-prop com.lab126.wifid enable 2>/dev/null) || { report preflight_failed wifi_state_unknown; exit 1; }
 original_saver=$(lipc-get-prop com.lab126.powerd preventScreenSaver 2>/dev/null) || { report preflight_failed screensaver_unknown; exit 1; }

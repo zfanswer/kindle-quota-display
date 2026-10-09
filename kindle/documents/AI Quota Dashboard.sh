@@ -1,5 +1,5 @@
 #!/bin/sh
-# Name: Agent 额度
+# Name: 开启Agent额度
 # Author: Kindle Quota Display
 # DontUseFBInk
 # UseHooks
