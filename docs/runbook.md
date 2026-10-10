@@ -103,7 +103,7 @@ python scripts/prepare.py kindle \
 
 ## 6. USB安装与推出
 
-先退出设备上的旧循环，再连接USB。macOS核对挂载点：
+先点击“停止 Agent 额度”退出设备旧循环，再连接USB。macOS核对挂载点：
 
 ```sh
 diskutil info /Volumes/Kindle
@@ -116,16 +116,22 @@ python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/
 python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/Kindle --apply
 ```
 
-安装器只处理本项目eink-dashboard和对应入口，先备份到runtime/backups/kindle-before-install，再复制并核验manifest。不会替换FBInk、Hotfix或个人文档。Linux须按实际挂载点手工备份/复制并校验；macOS安装器依赖diskutil，不适用于Linux。
+首次安装用上面的命令。已有项目必须用增量更新：
+
+```sh
+python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/Kindle --update --apply
+```
+
+--update只替换4个内部脚本、固定图及4个永久入口，共9个文件；server.conf/server.cache保留，临时Recover入口不重新添加。安装器先备份将被替换的文件到唯一runtime/backups/kindle-时间戳目录，再逐文件原子替换并核验SHA256；installation.json记录替换清单与保留配置的hash。USB更新不是整包事务，须先停止旧任务。不会替换FBInk、Hotfix或个人文档。Linux须按实际挂载点手工备份/复制并校验；macOS安装器依赖diskutil，不适用于Linux。
 
 正常安全推出整盘设备（用diskutil info确认实际整盘编号，勿照抄旧编号）或通过Finder推出。若被系统拒绝，停止占用并重新安全推出；不用强制卸载。退出USB模式后确认Kindle与宿主机同Wi-Fi。
 
 ## 7. 绘图、自动循环与停止
 
 - 点击“刷新 Agent 额度”做单次刷新；已有循环持锁时拒绝并发，先停止再测试。
-- 点击“开启Agent额度”先显示最近成功缓存，无有效缓存时显示固定刷新占位，再自检并启动；已有循环只恢复画面。占位图不含额度/时间，不作为成功数据缓存；坏缓存或占位图不阻塞联网。
-- 观察frame_ok、suspend_armed、resumed、再次frame_ok；肉眼核对方向、中文、数据和残影。
-- 点击“停止 Agent 额度”退出，确认Wi-Fi/屏保恢复并可正常阅读；电源键提前唤醒也可能按规则退出。
+- 点击“开启Agent额度”先显示最近成功缓存，无有效缓存时显示固定刷新占位，再做设备能力检查并启动；已有循环只恢复画面。占位图不含额度/时间，不作为成功数据缓存；坏缓存或占位图不阻塞联网。
+- 观察在线frame_ok、suspend_armed及后续frame_ok；resumed通常仅写Kindle本地日志；肉眼核对方向、中文、数据和残影。
+- 点击“停止 Agent 额度”退出，确认Wi-Fi/屏保恢复并可正常阅读；电源键/其他提前唤醒不停止循环，保持无线关闭，短交互后以剩余RTC等待继续。
 
 在已有设备终端中可检查：
 
@@ -133,9 +139,11 @@ python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/
 /mnt/us/eink-dashboard/quota-dashboard.sh status
 cat /mnt/us/eink-dashboard/server.cache
 cat /mnt/us/eink-dashboard/run.log
+cat /mnt/us/eink-dashboard/lifecycle.log
+cat /mnt/us/eink-dashboard/power.log
 ```
 
-不为调试临时安装SSH。USB可回读eink-dashboard持久日志；/tmp/kindle-quota-display是设备临时状态。发现失败用discovery.log，启动自检用bootstrap.log。
+不为调试临时安装SSH。USB可回读eink-dashboard持久日志；/tmp/kindle-quota-display是设备临时状态。发现失败用discovery.log，启动自检用bootstrap.log。lifecycle.log记录固定事件和系统epoch，不依赖服务器可达，达到256KiB时轮换为lifecycle.previous.log。resumed/early_wake表示提前返回且继续任务；stopped才表示退出。power.log记录每轮失败计数和下一间隔。离线、返回和停止事件通常只写本地，不因回报重新打开无线。
 
 观察工具只读服务器事件：
 
@@ -144,19 +152,21 @@ python scripts/observe-kindle.py --url http://127.0.0.1:8486 \
   --minutes 70 --cycles 20 --min-duration 3600
 ```
 
-summary为passed才表示满足脚本定义的轮次/时长/resumed条件；device_stopped、timeout、not_seen不算通过。事件是无认证自报，不能证明肉眼显示、实际功耗或full flash残影。
+新版观察工具只计算启动观察后的当前会话frame_ok数量和跨度，不再要求在线resumed，也不跨重启拼接。summary为passed表示收到足够帧回报（evidence=received_frames）；实际RTC需结合设备本地lifecycle.log核对；device_stopped、timeout、not_seen不算通过。事件是无认证自报，不能证明肉眼显示、实际功耗或full flash残影。
 
 ## 8. 故障与换网验收
 
 按[模板](acceptance-record.md)建立本地记录，至少验证：
 
-1. Mac服务离线时保留旧图，恢复后继续刷新；collector停止但服务在线时，数据超过10分钟显示过期。
-2. DHCP变化或换Wi-Fi后，缓存失效时主机名/实际私有子网发现恢复；固定Host绑定需要更新，0.0.0.0不需要。
-3. 手工“重找额度服务器”跳过缓存、保存新地址并尝试刷新；已有循环活动时下一轮使用新地址。
+1. Mac服务离线时保留旧图，观察失败后RTC间隔3→6→9→12→15分钟；已知地址恢复后最多额外等待15分钟，成功清零。collector停止但HTTP在线时，10分钟后生成过期状态；旧离线PNG不能自行改字。
+2. DHCP变化或换Wi-Fi后，主机名有效时可自动恢复；否则点击“重找额度服务器”，后台永不扫描。固定Host绑定需更新，0.0.0.0不需要。
+3. 手工“重找额度服务器”跳过缓存、保存新地址并尝试刷新；已有循环活动时通过请求跳过退避并立即尝试刷新。
 4. /21及更大网段、/31、/32或公网不自动扫描，通过固定IP/主机名配置；mDNS和AP隔离需环境验证。
-5. 至少一小时连续自动循环、30分钟full refresh、停止和提前唤醒恢复；提前退出不能将两段会话累加成一次不中断成功。
+5. 至少一小时连续自动循环、30分钟full refresh、停止恢复和提前唤醒继续刷新。提前唤醒后应有后续frame_ok，无stopped；实际退出后不能将两段会话累加成一次不中断成功。
 
-当前固定8秒联网等待可能不适合慢网络，详情见[电源行为](power-management.md)。锁存在但无活动进程时，先核对status/PID，确认无refresh/run再处理遗留锁，不能删除活动锁。
+30秒网络窗口与IPv4/已知地址短重试需要按实际AP验证，详情见[电源行为](power-management.md)。锁存在但无活动进程时，先核对status/PID，确认无refresh/run再处理遗留锁，不能删除活动锁。
+
+若启动自检立即失败且bootstrap.log写着`Lock exists`，说明生命周期锁占用。没有设备终端可核对进程时，正常安全退出USB后通过Kindle系统菜单重启，再点击“开启Agent额度”；重启清除旧进程和/tmp临时锁，也可能清除成功图片缓存，随后使用固定刷新占位图。不要仅凭没有新的服务器回报就删除锁。
 
 ## 9. 停止与回滚
 

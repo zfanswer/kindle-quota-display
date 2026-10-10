@@ -1,8 +1,10 @@
 """POSIX scripts run ONLY with fake HTTP/Wi-Fi/FBInk commands and local temp files."""
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -40,11 +42,15 @@ case "$url" in
  http://$MOCK_HOST:8486/frame/kindle1.png) cp "$MOCK_PNG" "$output";;
  *) exit 1;;
 esac""")
-        self.command("sleep", "exit 0")
+        self.command("sleep", 'if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi')
+        self.env["KQD_POWER_STATE"] = str(self.state / "unavailable-power")
+        self.env["KQD_RTC_ROOT"] = str(self.state / "unavailable-rtc")
         self.command("ip", "printf '    inet 192.168.1.52/24 brd 192.168.1.255 scope global wlan0\\n'")
         self.command("lipc-get-prop", "printf '1\\n'")
         self.command("lipc-set-prop", 'printf "lipc %s\\n" "$*" >> "$MOCK_LOG"')
         self.command("fbink", 'printf "fbink %s\\n" "$*" >> "$MOCK_LOG"; exit "${MOCK_FBINK_EXIT:-0}"')
+        (self.state / "uptime").write_text("100.00 0")
+        self.env["KQD_UPTIME"] = str(self.state / "uptime")
         self.conf()
 
     def command(self, name, body):
@@ -84,33 +90,19 @@ esac""")
         calls = self.log.read_text()
         paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
         self.assertEqual(paints, [f"fbink -q -i {self.base}/bootstrap-frame.png"])
-        self.assertLess(calls.index("fbink"), calls.index("wirelessEnable 1"))
+        self.assertNotIn("wirelessEnable 1", calls)
         self.assertFalse((self.state / "frame.png").exists(), "Placeholder must not become a quota cache")
 
-    def test_invalid_cache_shows_placeholder_then_live_frame(self):
+    def test_invalid_or_undecodable_cache_falls_back_to_placeholder(self):
         self.placeholder()
-        (self.state / "frame.png").write_bytes(b"bad cache")
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
-        self.run_script("bootstrap.sh")
-        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -i {self.base}/bootstrap-frame.png",
-                                  f"fbink -q -f -i {self.state}/frame.next.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
-
-    def test_cache_decode_failure_uses_placeholder_then_live_frame(self):
-        self.placeholder()
-        (self.state / "frame.png").write_bytes(frame(None, NOW))
-        self.command("fbink", '''printf "fbink %s\\n" "$*" >> "$MOCK_LOG"
+        for cache in (b"bad cache", frame(None, NOW)):
+            (self.state / "frame.png").write_bytes(cache)
+            self.command("fbink", '''printf "fbink %s\\n" "$*" >> "$MOCK_LOG"
 case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
-        self.run_script("bootstrap.sh")
-        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png",
-                                  f"fbink -q -i {self.base}/bootstrap-frame.png",
-                                  f"fbink -q -f -i {self.state}/frame.next.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+            result = self.run_script("bootstrap.sh")
+            self.assertNotEqual(result.returncode, 0)  # No fake RTC capability.
+            self.assertIn("bootstrap-frame.png", self.log.read_text())
+            self.assertFalse((self.state / "frame.next.png").exists())
 
     def test_cached_server_and_identity(self):
         (self.base / "server.cache").write_text("192.168.1.9\n")
@@ -124,7 +116,7 @@ case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
 
     def test_dhcp_recovery_on_actual_private_24(self):
         self.conf(ip="192.168.1.200")
-        result = self.run_script("find-server.sh", "--internal")
+        result = self.run_script("find-server.sh", "--internal", "--force")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.base / "server.cache").read_text().strip(), "192.168.1.9")
 
@@ -133,7 +125,7 @@ case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
         (self.base / "server.cache").write_text("192.168.1.200\n")
         self.env["MOCK_HOST"] = "10.23.8.9"
         self.command("ip", "printf '    inet 10.23.8.52/24 brd 10.23.8.255 scope global wlan0\\n'")
-        result = self.run_script("find-server.sh", "--internal")
+        result = self.run_script("find-server.sh", "--internal", "--force")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.base / "server.cache").read_text().strip(), "10.23.8.9")
 
@@ -141,7 +133,7 @@ case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
         self.conf(ip="")
         for cidr in ("192.168.1.52/16", "10.20.3.52/21", "172.20.10.2/31", "8.8.8.8/24"):
             self.command("ip", f"printf '    inet {cidr} scope global wlan0\\n'")
-            result = self.run_script("find-server.sh", "--internal")
+            result = self.run_script("find-server.sh", "--internal", "--force")
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((self.base / "server.cache").exists())
 
@@ -163,12 +155,135 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\\n' "$url" >> "$MOCK_LOG"
 exit 1''')
-        result = self.run_script("find-server.sh", "--internal")
+        result = self.run_script("find-server.sh", "--internal", "--force")
         self.assertNotEqual(result.returncode, 0)
         urls = self.log.read_text().splitlines()
         expected = {f"http://172.20.10.{n}:8486/healthz" for n in range(17, 31) if n != 18}
         self.assertEqual(set(urls), expected)
         self.assertEqual(len(urls), len(expected))
+
+    def test_automatic_discovery_deduplicates_and_never_scans(self):
+        (self.base / "server.cache").write_text("192.168.1.9")
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("SERVER_HOST=", "SERVER_HOST=mac.example"))
+        self.command("curl", 'printf "%s\\n" "$*" >> "$MOCK_LOG"; exit 1')
+        for args in ((), ("--known-only",)):
+            self.log.unlink(missing_ok=True)
+            result = self.run_script("find-server.sh", "--internal", *args)
+            self.assertNotEqual(result.returncode, 0)
+            urls = self.log.read_text().splitlines()
+            self.assertEqual(len(urls), 6)
+            self.assertTrue(all("192.168.1.9:8486/healthz" in url or "mac.example:8486/healthz" in url for url in urls))
+
+    def test_outer_timeout_bounds_hung_curl_and_wget_dns(self):
+        for client in ("curl", "wget"):
+            self.command(client, 'echo $$ > "$KQD_STATE/http-child"; exec /bin/sleep 30')
+            env = self.env.copy()
+            if client == "wget":
+                # A PATH with the required utilities but no curl exercises fallback.
+                minimal = self.state / "minimal-bin"
+                minimal.mkdir()
+                for name in ("awk", "sleep", "cat"):
+                    (minimal / name).symlink_to(shutil.which(name))
+                (minimal / "wget").symlink_to(self.bin / "wget")
+                (minimal / "sleep").unlink()
+                (minimal / "sleep").symlink_to(self.bin / "sleep")
+                env["PATH"] = str(minimal)
+            started = time.monotonic()
+            result = subprocess.run(["/bin/sh", "-c", ' . "$KQD_BASE/common.sh"; trap cancel_command 0; network_begin 2; fetch http://known.test/frame "$KQD_STATE/next" 15'],
+                                    env=env, capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertLess(time.monotonic() - started, 4)
+            pid = int((self.state / "http-child").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_no_ipv4_exhausts_one_budget_without_http_or_scan(self):
+        self.virtual_device(wakes="180", rounds=1)
+        self.command("ip", "exit 0")
+        self.command("curl", 'echo unexpected >> "$MOCK_LOG"; exit 1')
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("unexpected", self.log.read_text())
+        self.assertIn("rtc 180", self.log.read_text())
+        self.assertEqual((self.state / "uptime").read_text().split('.')[0], "130")
+        self.assertIn("failures=1 next_delay=180", (self.base / "power.log").read_text())
+
+    def start_visible_worker(self):
+        proc = self.state / "proc"
+        proc.mkdir()
+        self.env["KQD_PROC_ROOT"] = str(proc)
+        (self.state / "lock").mkdir()
+        log = self.state / "worker-test.log"
+        with log.open("wb") as output:
+            worker = subprocess.Popen(["/bin/sh", str(self.base / "quota-dashboard.sh"), "run"], env=self.env,
+                                      stdout=output, stderr=subprocess.STDOUT)
+        (proc / str(worker.pid)).mkdir()
+        (proc / str(worker.pid) / "cmdline").write_text(f"/bin/sh {self.base}/quota-dashboard.sh run")
+        deadline = time.monotonic() + 8
+        while not (self.state / "ready").exists() and worker.poll() is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        if not (self.state / "ready").exists():
+            if worker.poll() is None:
+                worker.terminate()
+            worker.wait(timeout=4)
+            self.fail(f"Worker did not become ready (exit {worker.returncode}): {log.read_text()}")
+        return worker
+
+    def test_manual_request_interrupts_backoff_and_coalesces(self):
+        self.conf(ip="192.168.1.200")
+        self.command("ip", "printf ' inet 192.168.1.2/28 scope global wlan0\\n'")
+        self.command("sleep", '''if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi
+if [ "$1" -ge 180 ]; then echo waiting >> "$MOCK_LOG"; exec /bin/sleep 5; fi
+exec /bin/sleep .02''')
+        original = (self.bin / "curl").read_text()
+        self.command("curl", 'case "$*" in *healthz*) /bin/sleep .1;; esac\n' + original.removeprefix("#!/bin/sh\n"))
+        (self.state / "result").write_text("wrong-request success")
+        worker = self.start_visible_worker()
+        try:
+            deadline = time.monotonic() + 3
+            while (not self.log.exists() or "waiting" not in self.log.read_text()) and time.monotonic() < deadline:
+                time.sleep(.01)
+            command = ["/bin/sh", str(self.base / "quota-dashboard.sh"), "rediscover"]
+            with subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as one, \
+                 subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as two:
+                for request in (one, two):
+                    out, err = request.communicate(timeout=8)
+                    self.assertEqual(request.returncode, 0, err)
+                    self.assertIn(b"Rediscovered and refreshed", out)
+            self.assertEqual((self.base / "server.cache").read_text().strip(), "192.168.1.9")
+            self.assertIn("failures=0 next_delay=180", (self.base / "power.log").read_text())
+            self.assertEqual(sum(line.endswith("frame.next.png") for line in self.log.read_text().splitlines()), 1)
+        finally:
+            self.run_script("quota-dashboard.sh", "stop")
+            worker.wait(timeout=4)
+        self.assertFalse((self.state / "lock").exists())
+
+    def test_stop_interrupts_hung_probe_and_reaps_child(self):
+        self.command("curl", 'echo $$ > "$KQD_STATE/http-child"; exec /bin/sleep 30')
+        worker = self.start_visible_worker()
+        try:
+            deadline = time.monotonic() + 3
+            while not (self.state / "http-child").exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue((self.state / "http-child").exists())
+            child = int((self.state / "http-child").read_text())
+            self.run_script("quota-dashboard.sh", "stop")
+            worker.wait(timeout=4)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+        finally:
+            if worker.poll() is None:
+                worker.terminate(); worker.wait(timeout=4)
+        self.assertFalse((self.state / "lock").exists())
+        self.assertFalse((self.state / "frame.png").exists())
+
+    def test_manual_without_worker_is_one_shot(self):
+        result = self.run_script("quota-dashboard.sh", "rediscover")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state / "frame.png").exists())
+        self.assertFalse((self.state / "lock").exists())
+        self.assertFalse((self.state / "pid").exists())
 
     def test_health_wrong_server_id_rejected(self):
         config = (self.base / "server.conf").read_text().replace("SERVER_ID=kqd-pw3", "SERVER_ID=other").replace("ENABLE_SCAN=1", "ENABLE_SCAN=0")
@@ -226,42 +341,29 @@ exit 1''')
         calls = self.log.read_text() if self.log.exists() else ""
         paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
         self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png"])
-        self.assertLess(calls.index("fbink"), calls.index("wirelessEnable 1"))
+        self.assertNotIn("wirelessEnable 1", calls)
         self.assertNotIn("bootstrap-frame.png", calls)
         self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
 
-    def test_bootstrap_only_paints_live_download_before_rtc_preflight(self):
-        (self.base / "bootstrap-frame.png").write_bytes(frame(None, NOW))
-        # Stop after real refresh, without accessing any host power/RTC path.
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
+    def test_bootstrap_offline_can_start_after_device_preflight(self):
+        self.placeholder()
+        power = self.state / "power"
+        power.touch()
+        rtc = self.state / "rtc/rtc0"
+        rtc.mkdir(parents=True)
+        (rtc / "wakealarm").write_text("0")
+        (rtc / "since_epoch").write_text("1700000000")
+        self.env.update(KQD_POWER_STATE=str(power), KQD_RTC_ROOT=str(rtc.parent))
+        script = self.base / "quota-dashboard.sh"
+        text = script.read_text().replace('    start)\n', '    start)\n        echo started > "$STATE/started"; exit 0\n')
+        script.write_text(text)
+        self.command("curl", "exit 1")
         result = self.run_script("bootstrap.sh")
-        self.assertNotEqual(result.returncode, 0)  # Fake device has no suspend capability.
-        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -f -i {self.state}/frame.next.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
-
-    def test_bootstrap_invalid_download_keeps_last_frame(self):
-        last_good = self.png.read_bytes()
-        (self.state / "frame.png").write_bytes(last_good)
-        (self.base / "bootstrap-frame.png").write_bytes(frame(None, NOW))
-        self.png.write_bytes(b"<html>bad frame</html>" * 3)
-        result = self.run_script("bootstrap.sh")
-        self.assertNotEqual(result.returncode, 0)
-        calls = self.log.read_text() if self.log.exists() else ""
-        paints = [line for line in calls.splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), last_good)
-
-    def test_bootstrap_shows_cache_then_live_frame(self):
-        (self.state / "frame.png").write_bytes(frame(None, NOW))
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
-        self.run_script("bootstrap.sh")
-        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -i {self.state}/frame.png",
-                                  f"fbink -q -f -i {self.state}/frame.next.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state / "started").exists())
+        self.assertIn("ALLOW_SUSPEND=1", (self.base / "server.conf").read_text())
+        self.assertNotIn("wirelessEnable", self.log.read_text())
+        self.assertFalse((self.state / "frame.png").exists())
 
     def test_show_cache_preserves_running_process_state(self):
         (self.state / "frame.png").write_bytes(self.png.read_bytes())
@@ -304,26 +406,6 @@ esac
         self.assertEqual(self.log.read_text().strip(), f"fbink -q -i {self.state}/frame.png")
         self.assertTrue((self.state / "lock").is_dir())
 
-    def test_bootstrap_invalid_cache_still_fetches_live_frame(self):
-        (self.state / "frame.png").write_bytes(b"bad cache")
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
-        self.run_script("bootstrap.sh")
-        paints = [line for line in self.log.read_text().splitlines() if line.startswith("fbink ")]
-        self.assertEqual(paints, [f"fbink -q -f -i {self.state}/frame.next.png"])
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
-
-    def test_bootstrap_cache_decode_failure_still_fetches_live_frame(self):
-        (self.state / "frame.png").write_bytes(frame(None, NOW))
-        self.command("fbink", '''printf "fbink %s\\n" "$*" >> "$MOCK_LOG"
-case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
-        script = self.base / "bootstrap.sh"
-        script.write_text(script.read_text().replace("/sys/power/state", str(self.state / "unavailable-power")))
-        self.run_script("bootstrap.sh")
-        self.assertIn(f"fbink -q -f -i {self.state}/frame.next.png", self.log.read_text())
-        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
-        self.assertFalse((self.state / "display-lock").exists())
-
     def test_cache_preview_cannot_repaint_old_frame_during_promotion(self):
         (self.state / "frame.png").write_bytes(frame(None, NOW))
         # Interleave a preview exactly after drawing the new frame but before
@@ -352,7 +434,7 @@ exec /bin/mv "$@"''')
     def test_debug_run_restores_initial_wifi_and_screensaver(self):
         (self.state / "lock").mkdir()
         self.command("lipc-get-prop", "printf '0\\n'")
-        self.command("sleep", 'if [ "$1" = 180 ]; then touch "$KQD_STATE/stop"; fi')
+        self.command("sleep", 'if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi; if [ "$1" = 180 ]; then touch "$KQD_STATE/stop"; fi')
         result = self.run_script("quota-dashboard.sh", "run")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
@@ -362,6 +444,115 @@ exec /bin/mv "$@"''')
         self.assertIn("preventScreenSaver 0", calls)
         self.assertFalse((self.state / "lock").exists())
         self.assertFalse((self.state / "pid").exists())
+
+    def virtual_device(self, wakes="180", rounds=2):
+        """Real worker and RTC code, with only clocks/device commands simulated."""
+        power = self.state / "power"
+        power.write_text("")
+        rtc = self.state / "rtc/rtc0"
+        rtc.mkdir(parents=True)
+        (rtc / "wakealarm").write_text("0")
+        (rtc / "since_epoch").write_text("1700000000")
+        (self.state / "uptime").write_text("100.00 0")
+        self.env.update(KQD_POWER_STATE=str(power), KQD_RTC_ROOT=str(rtc.parent),
+                        KQD_UPTIME=str(self.state / "uptime"), MOCK_WAKES=wakes,
+                        MOCK_ROUNDS=str(rounds), MOCK_POWER=str(power))
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("ALLOW_SUSPEND=0", "ALLOW_SUSPEND=1"))
+        self.command("sync", "exit 0")
+        self.command("cat", '''case "$1" in
+ */wakealarm)
+  value=$(/bin/cat "$1")
+  case "$value" in +*) now=$(/bin/cat "${1%/wakealarm}/since_epoch"); value=$((now + ${value#+})); printf '%s' "$value" > "$1"; printf '%s\\n' "$value";; *) printf '%s' "$value";; esac;;
+ */since_epoch)
+  now=$(/bin/cat "$1")
+  if [ "$(/bin/cat "$MOCK_POWER")" = mem ]; then
+   alarm=$(/bin/cat "${1%/since_epoch}/wakealarm")
+   case "$alarm" in +*) delay=${alarm#+};; *) delay=$((alarm - now));; esac
+   n=0; [ ! -f "$KQD_STATE/suspends" ] || n=$(/bin/cat "$KQD_STATE/suspends")
+   n=$((n+1)); printf '%s' "$n" > "$KQD_STATE/suspends"
+   wake=$(printf '%s' "$MOCK_WAKES" | cut -d, -f"$n")
+   [ -n "$wake" ] || wake=$delay
+   printf 'rtc %s\\n' "$delay" >> "$MOCK_LOG"
+   now=$((now + wake)); printf '%s' "$now" > "$1"
+   : > "$MOCK_POWER"
+   [ "$n" -lt "$MOCK_ROUNDS" ] || touch "$KQD_STATE/stop"
+  fi
+  printf '%s' "$now";;
+ *) exec /bin/cat "$@";;
+esac''')
+        self.command("sleep", '''if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi
+printf 'sleep %s\\n' "$1" >> "$MOCK_LOG"
+rtc="$KQD_RTC_ROOT/rtc0/since_epoch"
+now=$(/bin/cat "$rtc"); printf '%s' "$((now + $1))" > "$rtc"
+now=$(cut -d. -f1 "$KQD_UPTIME"); printf '%s.00 0' "$((now + $1))" > "$KQD_UPTIME"''')
+
+    def worker(self):
+        (self.state / "lock").mkdir()
+        return self.run_script("quota-dashboard.sh", "run")
+
+    def test_offline_backoff_caps_and_success_resets(self):
+        self.virtual_device(wakes=",".join(["180", "360", "540", "720", "900", "900", "180", "180"]), rounds=8)
+        original = (self.bin / "curl").read_text()
+        self.command("lipc-set-prop", '''printf 'lipc %s\\n' "$*" >> "$MOCK_LOG"
+case "$*" in *"wirelessEnable 1")
+ n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
+ printf '%s' "$((n+1))" > "$KQD_STATE/attempts";; esac''')
+        self.command("curl", '''n=$(/bin/cat "$KQD_STATE/attempts")
+[ "$n" = 7 ] || exit 1
+''' + original.removeprefix("#!/bin/sh\n"))
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        waits = [int(line.split()[1]) for line in self.log.read_text().splitlines() if line.startswith("rtc ")]
+        self.assertEqual(waits, [180, 360, 540, 720, 900, 900, 180, 180])
+        self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+        summaries = (self.base / "power.log").read_text()
+        self.assertIn("failures=0 next_delay=180", summaries)
+        self.assertIn("failures=1 next_delay=180", summaries.split("failures=0 next_delay=180")[1])
+
+    def test_early_resume_rearms_remaining_with_wifi_off(self):
+        self.virtual_device(wakes="17,143", rounds=2)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertIn("rtc 180", calls)
+        self.assertIn("sleep 20", calls)
+        self.assertIn("rtc 143", calls)
+        early = calls.index("rtc 180")
+        again = calls.index("rtc 143")
+        self.assertFalse(any("wirelessEnable 1" in call for call in calls[early:again]))
+        self.assertEqual(sum(call.endswith("frame.next.png") for call in calls), 1)
+        self.assertFalse((self.state / "lock").exists())
+
+    def test_repeated_immediate_resume_exits_safely(self):
+        self.virtual_device(wakes="0,0,0", rounds=99)
+        result = self.worker()
+        self.assertNotEqual(result.returncode, 0)
+        events = [json.loads(line) for line in (self.base / "lifecycle.log").read_text().splitlines()]
+        self.assertEqual(events[-1]["reason"], "suspend_failed")
+        self.assertFalse((self.state / "lock").exists())
+        self.assertEqual(sum("wirelessEnable 1" in call for call in self.log.read_text().splitlines()), 2)  # round + restore only
+
+    def test_wall_clock_change_does_not_change_rtc_wait(self):
+        self.virtual_device(wakes="180", rounds=1)
+        self.command("date", "printf '1\\n'")
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rtc 180", self.log.read_text())
+        self.assertFalse((self.state / "lock").exists())
+
+    def test_lifecycle_is_logged_when_server_is_offline_and_rotates(self):
+        old = b"x" * 262144
+        (self.base / "lifecycle.log").write_bytes(old)
+        self.command("curl", "exit 1")
+        result = subprocess.run(["/bin/sh", "-c", '. "$KQD_BASE/common.sh"; report resumed early_wake'],
+                                env=self.env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.base / "lifecycle.previous.log").read_bytes(), old)
+        event = json.loads((self.base / "lifecycle.log").read_text())
+        self.assertEqual(event["stage"], "resumed")
+        self.assertEqual(event["reason"], "early_wake")
+        self.assertLess((self.base / "lifecycle.log").stat().st_size, 1024)
 
     def test_rtc_alarm_accepts_hardware_clock_older_than_system_clock(self):
         rtc_root = Path(self.tmp.name) / "rtc"

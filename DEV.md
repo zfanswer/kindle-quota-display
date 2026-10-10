@@ -21,13 +21,13 @@
 | `quota_display/render.py` | 1072×1448 中文 L8 图片、卡片、16 灰阶、固定时间 | PNG 校验、字体选择、第三窗口及无数据布局 |
 | `quota_display/server.py` | 只读额度/图片 HTTP；分钟缓存；固定设备遥测 | 路由、响应大小、no-store、遥测白名单与枚举 |
 | `kindle/common.sh` | 严格配置、下载/probe、PNG 校验、Wi-Fi 状态、RTC、遥测 | 不执行配置文本、BusyBox 兼容、恢复原状态 |
-| `kindle/find-server.sh` | 有界私有子网发现、实例身份匹配、地址缓存 | CIDR 边界、预算、缓存失效、公网拒绝 |
-| `kindle/quota-dashboard.sh` | 生命周期、绘图、RTC 循环、停止/早醒清理 | 锁与 PID 归属、Wi-Fi/屏保、其他 RTC alarm |
-| `kindle/bootstrap.sh` | 真实自检、启用休眠、启动循环 | 已运行幂等、配置修改、设备能力与状态恢复 |
+| `kindle/find-server.sh` | 自动已知地址探测、手动有界私有子网发现、身份匹配、缓存 | CIDR 边界、预算、缓存失效、公网拒绝 |
+| `kindle/quota-dashboard.sh` | 生命周期、绘图、RTC 循环、早醒继续与停止清理 | 锁与 PID 归属、Wi-Fi/屏保、其他 RTC alarm |
+| `kindle/bootstrap.sh` | 设备能力自检（不要求Mac在线）、启用休眠、启动循环 | 已运行幂等、配置修改、设备能力与状态恢复 |
 | `kindle/documents/*.sh` | Scriptlet 用户入口和安装钩子 | `Name`、`DontUseFBInk`、`UseHooks`、日志方式 |
 | `scripts/prepare.py` | 只生成 plist 或 Kindle 包与 manifest | 绝对路径、输出范围、参数、默认值 |
 | `scripts/install-kindle.py` | macOS USB 目标核验、备份、复制和 hash 核验 | 卷名/挂载点、符号链接、项目文件范围 |
-| `scripts/observe-kindle.py` | 只读设备事件，记录有限时间的验收结果 | `not_seen`、重启清空、早醒退出和证据边界 |
+| `scripts/observe-kindle.py` | 只读设备事件，记录有限时间的验收结果 | `not_seen`、重启清空、退出事件和证据边界 |
 
 Docker Compose 的服务名为 `eink-dashboard`，镜像由本项目 `Dockerfile` 构建。容器只读挂载 `runtime/`，非 root 运行，不含 CodexBar、账户凭据或设备执行通道。
 
@@ -50,7 +50,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q quota_display scripts tests
 ```
 
-完整离线检查包含 unittest、Shell 语法检查、合成 snapshot 和五种预览。`tests/test_kindle.py` 使用假的 HTTP/LIPC/FBInk/ip/sleep，不允许把测试命令替换成真实设备命令。`tests/fixtures/` 和 `docs/schema/example.json` 都是合成数据。
+完整离线检查包含 unittest、Shell语法检查、合成snapshot和五种预览。`tests/test_kindle.py` 使用假的 HTTP/LIPC/FBInk/ip/sleep，不允许把测试命令替换成真实设备命令。`tests/fixtures/` 和 `docs/schema/example.json` 都是合成数据。
 
 可单独生成合成输入与图片：
 
@@ -82,13 +82,15 @@ python scripts/render-previews.py
 - PW3 1072×1448 是当前唯一适配目标；换分辨率须同时改 renderer 和 `common.sh valid_png`。
 - Scriptlets 需要支持 hooks；主入口文件只有函数定义，普通 `sh entry.sh` 不会自动调用 `on_run`。
 - 主入口自检通过后将 `ALLOW_SUSPEND=0` 改为 1。若要支持 Wi-Fi 常开模式，需调整 bootstrap 的策略，不能只改配置或删掉关无线语句。
-- 省电模式每轮关闭无线、RTC 休眠、唤醒再开无线；目前联网等待为固定 8 秒，尚无关联/IP 就绪判断。
+- 省电模式每轮关闭无线、RTC休眠；正常3分钟，连续失败每次加3分钟至15分钟。下一轮有30秒共享网络预算和IPv4就绪判断/已知地址短重试，不自动扫描子网。
 - 其他进程占用 wakealarm 时不能覆盖；RTC 设备/epoch 支持按实际驱动核验。
+- 早醒只记录为resumed/early_wake，不自动退出。恢复屏保保护、按需重画缓存；无线关闭的20秒短交互后，按硬件RTC截止时间重挂起剩余计划。60秒内3次立即返回或硬件计时异常保护性退出。停止入口可中断等待并恢复原状态，电源键不用于退出循环。
+- 固定事件同时写入设备lifecycle.log，达到256KiB时轮换为lifecycle.previous.log；日志在服务器不可达时也保留，不含原始CLI/HTTP数据。
 - 临时恢复入口成功绘图两次后删除；Library 重新索引可能滞后。正常操作用四个永久入口。
 - 启动先显示最近成功frame.png，无有效缓存则显示固定“正在刷新quota信息”，再联网；已有worker也可恢复画面。show-cache不改Wi-Fi/RTC/进程状态，占位不提交为真实缓存；/tmp不保证跨重启。
 - 固定资产在kindle/assets/bootstrap-frame.png，部署到同名设备路径；refresh-v1标记使旧版额度快照被忽略。可用`python -m quota_display.render --placeholder --output kindle/assets/bootstrap-frame.png`重建，不接受quota输入或时间参数。
 - 绘图与成功缓存提交由同一display-lock保护，预览不能在新图绘制与提交之间重绘旧图；生命周期锁与绘图锁各司其职。
-- 发现限制实际私有 `/22` 至 `/30`；SERVER_ID 是身份标记而非认证。
+- 自动只探测缓存/IP/主机名；手动扫描限制实际私有 `/22` 至 `/30`；SERVER_ID 是身份标记而非认证。活动worker的rediscover请求有ID/ready握手，不能用信号单独唤醒mem。
 
 ## 二开方向与验证要求
 
@@ -119,4 +121,4 @@ python scripts/render-previews.py
 
 ## 发布
 
-遵循 [发布说明](docs/releasing.md)。`docs/local/` 中若有私人历史，仅是本地归档，不是贡献规则或公开文档依赖。本仓库采用 Apache-2.0；第三方来源记录在 [sources.md](docs/references/sources.md)。
+遵循 [发布说明](docs/releasing.md)。`docs/local/` 仅保留本地部署摘要，不是贡献规则或公开文档依赖。临时诊断脚本、测试输出及旧安装包可清理；保留正式tests、运行数据、必要验收证据和回滚备份。本仓库采用 Apache-2.0；第三方来源记录在 [sources.md](docs/references/sources.md)。

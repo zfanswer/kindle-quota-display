@@ -8,10 +8,12 @@
 
 - `.env`及变体（保留公开`.env.example`）、credentials/secrets、实际server.conf/server.cache、`*.local.*`配置。
 - runtime中的真实quota、日志、事件、设备备份；build/dist中的安装包、plist、诊断和输出。
-- docs/local中的聊天、个人路径/IP、安装记录和历史截图；个人验收另存docs/acceptance.local.md。
+- docs/local中的本地部署摘要、个人路径/IP、安装及验收记录；个人验收也可另存docs/acceptance.local.md。
 - 虚拟环境、Python缓存、OS/编辑器文件、本地Agent/CodeGraph数据。
 
 不要为发布而删除仍在使用的.env、runtime或设备备份，忽略即可。Docker构建上下文采用白名单，只包含Dockerfile、requirements.txt和quota_display源码。
+
+临时诊断脚本、重复源码副本、旧生成包和测试输出可在工作完成后清理。正式tests/fixtures是可重复验证的一部分；本地保留最近安装报告、必要验收证据及回滚备份，公开验证文档描述当前结果与边界，不堆积逐次排查流水。
 
 ## 首次提交前
 

@@ -5,6 +5,94 @@ STATE=${KQD_STATE:-/tmp/kindle-quota-display}
 CONF=$BASE/server.conf
 SERVER_IP= SERVER_HOST= PORT=8486 SERVER_ID=kqd-pw3 ENABLE_SCAN=1
 INTERVAL=180 FULL_REFRESH=1800 FBINK=/mnt/us/libkh/bin/fbink ALLOW_SUSPEND=0
+CHILD_PID= CHILD_GROUP=0 TIMER_PID= NETWORK_OK=0
+
+# /proc/uptime avoids wall-clock corrections in a short awake network budget.
+tick() {
+    awk '{split($1,a,"."); if(a[1] ~ /^[0-9]+$/) print a[1]; else exit 1}' "${KQD_UPTIME:-/proc/uptime}"
+}
+network_begin() {
+    KQD_NET_DEADLINE=$(($(tick) + $1)); export KQD_NET_DEADLINE
+    NETWORK_OK=0
+}
+budget_timeout() {
+    budget_cap=$1
+    if [ -n "${KQD_NET_DEADLINE:-}" ]; then
+        budget_left=$((KQD_NET_DEADLINE - $(tick)))
+        [ "$budget_left" -gt 0 ] || return 1
+        [ "$budget_cap" -le "$budget_left" ] || budget_cap=$budget_left
+    fi
+    printf '%s\n' "$budget_cap"
+}
+cancel_command() {
+    if [ -n "$CHILD_PID" ]; then
+        signal_child TERM
+        # Do not leave a stopped worker waiting for the original 30/120s budget.
+        (
+            cancel_sleep=
+            trap 'kill "$cancel_sleep" 2>/dev/null || true; wait "$cancel_sleep" 2>/dev/null || true; exit 0' 1 2 15
+            KQD_WATCHDOG=1 sleep 1 & cancel_sleep=$!
+            wait "$cancel_sleep" || exit 0
+            signal_child KILL
+        ) & cancel_pid=$!
+        wait "$CHILD_PID" 2>/dev/null || true
+        kill "$cancel_pid" 2>/dev/null || true
+        wait "$cancel_pid" 2>/dev/null || true
+        CHILD_PID=
+    fi
+    if [ -n "$TIMER_PID" ]; then
+        kill "$TIMER_PID" 2>/dev/null || true
+        wait "$TIMER_PID" 2>/dev/null || true
+        TIMER_PID=
+    fi
+}
+signal_child() {
+    if [ "$CHILD_GROUP" -eq 1 ]; then kill -"$1" "-$CHILD_PID" 2>/dev/null || true
+    else kill -"$1" "$CHILD_PID" 2>/dev/null || true; fi
+}
+bounded() {
+    # curl/wget DNS and the complete request are bounded, including wget builds
+    # where -T only covers individual I/O. Callers own child cleanup on signals.
+    bounded_seconds=$1; shift
+    CHILD_GROUP=0
+    if [ "${KQD_IN_COMMAND_GROUP:-0}" -eq 0 ] && command -v setsid >/dev/null 2>&1; then
+        # Nested discovery requests stay in this owned group; they must not
+        # escape a parent's forced timeout by creating another session.
+        KQD_IN_COMMAND_GROUP=1 setsid "$@" & CHILD_PID=$!; CHILD_GROUP=1
+    else
+        "$@" & CHILD_PID=$!
+    fi
+    (
+        timer_sleep=
+        trap 'if [ -n "$timer_sleep" ]; then kill "$timer_sleep" 2>/dev/null || true; wait "$timer_sleep" 2>/dev/null || true; fi; exit 0' 1 2 15
+        KQD_WATCHDOG=1 sleep "$bounded_seconds" & timer_sleep=$!
+        wait "$timer_sleep" || exit 0
+        timer_sleep=
+        signal_child TERM
+        KQD_WATCHDOG=1 sleep 1 & timer_sleep=$!
+        wait "$timer_sleep" || exit 0
+        timer_sleep=
+        signal_child KILL
+    ) & TIMER_PID=$!
+    bounded_result=0
+    # USR1 can interrupt wait without terminating the network command.
+    while :; do
+        wait "$CHILD_PID" && bounded_result=0 || bounded_result=$?
+        [ "$bounded_result" -ge 128 ] || break
+        kill -0 "$CHILD_PID" 2>/dev/null || break
+    done
+    CHILD_PID=
+    kill "$TIMER_PID" 2>/dev/null || true
+    wait "$TIMER_PID" 2>/dev/null || true
+    TIMER_PID=
+    return "$bounded_result"
+}
+bounded_log() {
+    if [ -f "$1" ] && [ "$(wc -c < "$1")" -ge 262144 ]; then
+        mv "$1" "${1%.log}.previous.log" 2>/dev/null || true
+    fi
+    printf '%s\n' "$2" >> "$1" 2>/dev/null || true
+}
 
 valid_ip() {
     printf '%s\n' "$1" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255) exit 1}'
@@ -42,11 +130,12 @@ load_conf() {
     [ "$FULL_REFRESH" -ge "$INTERVAL" ] || return 1
 }
 fetch() {
-    url=$1; output=$2; timeout=$3
+    url=$1; output=$2
+    timeout=$(budget_timeout "$3") || return 1
     if command -v curl >/dev/null 2>&1; then
-        curl -q --fail --silent --connect-timeout "$timeout" --max-time "$timeout" --max-filesize 262144 -o "$output" "$url"
+        bounded "$timeout" curl -q --fail --silent --connect-timeout "$timeout" --max-time "$timeout" --max-filesize 262144 -o "$output" "$url"
     else
-        wget -q -t 1 -T "$timeout" -O "$output" "$url"
+        bounded "$timeout" wget -q -t 1 -T "$timeout" -O "$output" "$url"
     fi
 }
 probe() {
@@ -76,17 +165,29 @@ valid_placeholder() {
     marker=$(dd if="$1" bs=1 skip=33 count=34 2>/dev/null | od -An -tx1 | tr -d ' \n')
     [ "$marker" = '0000001a744558746b71642d706c616365686f6c64657200726566726573682d7631' ]
 }
-wifi_begin() {
-    WIFI_PREVIOUS=$(lipc-get-prop com.lab126.cmd wirelessEnable 2>/dev/null) || WIFI_PREVIOUS=$(lipc-get-prop com.lab126.wifid enable 2>/dev/null) || return 1
+wifi_capture() {
+    bounded 3 lipc-get-prop com.lab126.cmd wirelessEnable > "$STATE/wifi-previous" 2>/dev/null ||
+        bounded 3 lipc-get-prop com.lab126.wifid enable > "$STATE/wifi-previous" 2>/dev/null || return 1
+    WIFI_PREVIOUS=$(cat "$STATE/wifi-previous")
     case "$WIFI_PREVIOUS" in 0|1) ;; *) return 1;; esac
-    lipc-set-prop com.lab126.cmd wirelessEnable 1 >/dev/null 2>&1 || return 1
-    sleep 8
+}
+wifi_begin() {
+    [ -n "${WIFI_PREVIOUS:-}" ] || wifi_capture || return 1
+    timeout=$(budget_timeout 3) || return 1
+    bounded "$timeout" lipc-set-prop com.lab126.cmd wirelessEnable 1 >/dev/null 2>&1 || return 1
+    while budget_timeout 1 >/dev/null; do
+        timeout=$(budget_timeout 2) || return 1
+        bounded "$timeout" ip -4 addr show dev wlan0 > "$STATE/wifi-address" 2>/dev/null || true
+        wifi_ip=$(awk '$1=="inet" {split($2,a,"/"); print a[1]; exit}' "$STATE/wifi-address")
+        if valid_ip "$wifi_ip" && [ "$wifi_ip" != 0.0.0.0 ]; then return 0; fi
+        sleep 1
+    done
+    return 1
 }
 report() {
     # Fixed enums only. This telemetry cannot execute host commands or alter quota.
     report_host=$SERVER_IP
     [ ! -f "$BASE/server.cache" ] || report_host=$(cat "$BASE/server.cache")
-    valid_host "$report_host" || return 0
     report_rtc=${RTC:-/sys/class/rtc/rtc0/wakealarm}
     rtc_device=0; case "$report_rtc" in */rtc1/wakealarm) rtc_device=1;; esac
     rtc_epoch=$(cat "${report_rtc%/wakealarm}/since_epoch" 2>/dev/null) || rtc_epoch=0
@@ -97,30 +198,36 @@ report() {
     case "$alarm_epoch" in ''|*[!0-9]*) alarm_epoch=0;; esac
     case "$elapsed_seconds" in ''|*[!0-9]*) elapsed_seconds=0;; esac
     payload=$(printf '{"stage":"%s","reason":"%s","interval":%s,"cycles":%s,"rtc_device":%s,"rtc_epoch":%s,"system_epoch":%s,"alarm_epoch":%s,"elapsed_seconds":%s}' "$1" "${2:-none}" "$INTERVAL" "${CYCLES:-0}" "$rtc_device" "$rtc_epoch" "$system_epoch" "$alarm_epoch" "$elapsed_seconds")
+    # Preserve fixed lifecycle evidence even when the server is unavailable.
+    # Keep at most two ~256 KiB files; never include upstream/network payloads.
+    bounded_log "$BASE/lifecycle.log" "$payload"
+    [ "$NETWORK_OK" -eq 1 ] || return 0
+    valid_host "$report_host" || return 0
+    timeout=$(budget_timeout 2) || return 0
     if command -v curl >/dev/null 2>&1; then
-        curl -q --silent --fail --connect-timeout 2 --max-time 2 -H 'Content-Type: application/json' --data "$payload" "http://$report_host:$PORT/api/device/kindle1" >/dev/null 2>&1 || true
+        bounded "$timeout" curl -q --silent --fail --connect-timeout "$timeout" --max-time "$timeout" -H 'Content-Type: application/json' --data "$payload" "http://$report_host:$PORT/api/device/kindle1" >/dev/null 2>&1 || true
     else
-        wget -q -t 1 -T 2 --post-data="$payload" -O /dev/null "http://$report_host:$PORT/api/device/kindle1" >/dev/null 2>&1 || true
+        bounded "$timeout" wget -q -t 1 -T "$timeout" --post-data="$payload" -O /dev/null "http://$report_host:$PORT/api/device/kindle1" >/dev/null 2>&1 || true
     fi
 }
 wifi_restore() {
-    case "${WIFI_PREVIOUS:-}" in 0|1) lipc-set-prop com.lab126.cmd wirelessEnable "$WIFI_PREVIOUS" >/dev/null 2>&1 || true;; esac
+    case "${WIFI_PREVIOUS:-}" in 0|1) bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable "$WIFI_PREVIOUS" >/dev/null 2>&1 || true;; esac
 }
 arm_rtc() {
-    # RTC epoch can differ from the system clock. Validate a nonzero armed alarm,
-    # and measure early wake using elapsed system time rather than comparing epochs.
+    rtc_delay=${1:-$INTERVAL}
+    valid_uint "$rtc_delay" 1 3600 || return 1
     for rtc_dir in "${KQD_RTC_ROOT:-/sys/class/rtc}/rtc0" "${KQD_RTC_ROOT:-/sys/class/rtc}/rtc1"; do
         candidate=$rtc_dir/wakealarm
         [ -w "$candidate" ] || continue
         current=$(cat "$candidate" 2>/dev/null) || continue
         [ -z "$current" ] || [ "$current" = 0 ] || continue
         printf '0\n' > "$candidate" || continue
-        if ! printf '+%s\n' "$INTERVAL" > "$candidate"; then
+        if ! printf '+%s\n' "$rtc_delay" > "$candidate"; then
             # Older RTC drivers may support only an absolute hardware RTC epoch.
             rtc_now=$(cat "$rtc_dir/since_epoch" 2>/dev/null) || continue
             case "$rtc_now" in ''|*[!0-9]*) continue;; esac
             [ "${#rtc_now}" -le 11 ] || continue
-            printf '%s\n' "$((rtc_now + INTERVAL))" > "$candidate" || continue
+            printf '%s\n' "$((rtc_now + rtc_delay))" > "$candidate" || continue
         fi
         alarm=$(cat "$candidate" 2>/dev/null) || alarm=
         case "$alarm" in ''|*[!0-9]*) printf '0\n' > "$candidate" || true; continue;; esac
@@ -131,5 +238,13 @@ arm_rtc() {
         printf '0\n' > "$candidate" || true
     done
     return 1
+}
+clear_rtc() {
+    # An alarm replaced by another owner must not be cleared during cleanup.
+    if [ "${ALARM_OWNED:-0}" -eq 1 ]; then
+        rtc_current=$(cat "$RTC" 2>/dev/null) || rtc_current=
+        [ "$rtc_current" != "$ALARM" ] || printf '0\n' > "$RTC" || true
+        ALARM_OWNED=0
+    fi
 }
 load_conf || { echo 'Invalid Kindle config' >&2; exit 2; }

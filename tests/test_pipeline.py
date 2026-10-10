@@ -14,7 +14,7 @@ from unittest.mock import patch
 from datetime import timedelta
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from quota_display.collector import CollectionError, atomic_write, collect, read_snapshot, run_cli
 from quota_display.model import PayloadError, normalize, timestamp, validate_snapshot
@@ -55,6 +55,67 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual((bundle / "eink-dashboard/bootstrap-frame.png").read_bytes(), asset)
             manifest = json.loads((bundle / "manifest.json").read_text())
             self.assertEqual(manifest["eink-dashboard/bootstrap-frame.png"], hashlib.sha256(asset).hexdigest())
+
+    def test_timestamp_is_black_in_header_and_keeps_original_sample(self):
+        data = good()
+        data["providers"]["claude"]["status"] = "error"
+        calls = []
+        original = ImageDraw.ImageDraw.text
+        def record(draw, xy, value, *args, **kwargs):
+            calls.append((xy, value, kwargs))
+            return original(draw, xy, value, *args, **kwargs)
+        with patch.object(ImageDraw.ImageDraw, "text", record):
+            frame(data, NOW + timedelta(days=2))
+        updates = [(xy, value, options) for xy, value, options in calls if value.startswith("数据更新")]
+        self.assertEqual(len(updates), 2)
+        for xy, value, options in updates:
+            self.assertEqual(value, "数据更新 2026-10-07 19:59")
+            self.assertEqual(options["fill"], 0)
+            self.assertEqual(options["font"].size, 26)
+            self.assertLess(xy[0] + options["font"].getlength(value), 993)
+            # Keep enough space after even the longer provider name.
+            title = next((pos, val, opts) for pos, val, opts in calls
+                         if val in ("Codex", "Claude Code") and pos[1] == xy[1] - 12)
+            self.assertGreater(xy[0], title[0][0] + title[2]["font"].getlength(title[1]) + 20)
+        statuses = [(xy, value) for xy, value, _ in calls if "过期" in value]
+        self.assertEqual(len(statuses), 2)
+        self.assertTrue(all(xy[0] == 80 for xy, _ in statuses))
+
+    def test_update_installer_preserves_config_cache_and_unrelated_files(self):
+        spec = importlib.util.spec_from_file_location("install_kindle", ROOT / "scripts/install-kindle.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bundle = base / "bundle"
+            # The generator is independently exercised through its guarded CLI.
+            prepare_spec = importlib.util.spec_from_file_location("prepare", ROOT / "scripts/prepare.py")
+            prepare = importlib.util.module_from_spec(prepare_spec)
+            prepare_spec.loader.exec_module(prepare)
+            prepare.bundle("", "", "kqd-pw3", bundle)
+            mount = base / "mount"
+            app = mount / "eink-dashboard"
+            app.mkdir(parents=True)
+            (mount / "documents").mkdir()
+            (mount / "documents/user-note.txt").write_text("keep")
+            (app / "quota-dashboard.sh").write_text("previous worker")
+            (app / "server.conf").write_bytes(b"device-owned config")
+            (app / "server.cache").write_bytes(b"192.0.2.7")
+            report = module.install(bundle, mount, base / "backup", update=True)
+            self.assertEqual(len(report["files"]), 9)
+            self.assertEqual((app / "server.conf").read_bytes(), b"device-owned config")
+            self.assertEqual((app / "server.cache").read_bytes(), b"192.0.2.7")
+            self.assertEqual((mount / "documents/user-note.txt").read_text(), "keep")
+            self.assertFalse((mount / "documents/Recover Agent Quota.sh").exists())
+            self.assertEqual((base / "backup/eink-dashboard/quota-dashboard.sh").read_text(), "previous worker")
+            with self.assertRaisesRegex(ValueError, "--update"):
+                module.install(bundle, mount, base / "other-backup")
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            manifest["documents/user-note.txt"] = "injected"
+            (bundle / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "file list"):
+                module.install(bundle, mount, base / "bad-backup", update=True)
+            self.assertFalse((base / "bad-backup").exists())
 
     def test_percentage_and_reset_mapping(self):
         p = normalize(fixture("codex"), "codex", NOW)
@@ -242,6 +303,20 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(module.is_mounted_kindle(info, mount))
             self.assertFalse(module.is_mounted_kindle(dict(info, MountPoint="/other/mount"), mount))
             self.assertFalse(module.is_mounted_kindle(dict(info, VolumeName="Other"), mount))
+
+    def test_observer_counts_new_session_frames_without_requiring_online_resumes(self):
+        spec = importlib.util.spec_from_file_location("observe", ROOT / "scripts/observe-kindle.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        def event(minutes, cycle):
+            return {"stage": "frame_ok", "reason": "none", "cycles": cycle,
+                    "received_at": (NOW + timedelta(minutes=minutes)).isoformat()}
+        frames = [event(1, 10), event(4, 11), event(7, 12)]
+        self.assertEqual(module.summarize(frames, 3, 360, NOW)["verdict"], "passed")
+        self.assertEqual(module.summarize(frames, 3, 360, NOW + timedelta(minutes=8))["frames"], 0)
+        frames.append(event(10, 1))
+        self.assertEqual(module.summarize(frames, 3, 360, NOW)["frames"], 1)
+        self.assertEqual(module.summarize(frames, 3, 360, NOW)["verdict"], "observing")
 
     def test_collector_lock_prevents_overlapping_writer(self):
         with tempfile.TemporaryDirectory() as tmp:

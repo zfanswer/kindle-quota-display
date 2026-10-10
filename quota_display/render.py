@@ -92,15 +92,17 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600, *, _refreshing=
                 state = "数据过期"
             else:
                 state = "正常"
-        text(right, y + 44, state, 26, True, True)
         if _refreshing:
-            updated = "等待最新额度数据"
+            updated = "等待更新"
         elif p and p["sampled_at"]:
             sample = timestamp(p["sampled_at"]).astimezone(zone)
             updated = "数据更新 " + sample.strftime("%Y-%m-%d %H:%M")
         else:
             updated = "尚无成功采集"
-        text(left, y + 100, updated, 25, fill=85)
+        # The original sample time is the primary freshness signal on a frozen
+        # e-ink frame. Keep it black and prominent; status remains below it.
+        text(right, y + 44, updated, 26, True, True)
+        text(left, y + 100, state, 25, fill=85)
         draw.line((left, y + 140, right, y + 140), fill=170, width=1)
         windows = p["windows"] if p else []
         if not windows:

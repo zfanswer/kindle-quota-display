@@ -3,10 +3,5 @@
 # Author: Kindle Quota Display
 # DontUseFBInk
 BASE=/mnt/us/eink-dashboard
-# Persist a bounded last result because the Library may hide script stdout.
-if host=$("$BASE/find-server.sh" --force 2> "$BASE/discovery.log"); then
-    printf 'FOUND %s\n' "$host" > "$BASE/discovery.log"
-    # Make a successful manual rediscovery visible with the current quota image.
-    exec "$BASE/quota-dashboard.sh" refresh
-fi
-exit 1
+# The active worker owns Wi-Fi, RTC and drawing; otherwise perform one shot.
+exec "$BASE/quota-dashboard.sh" rediscover > "$BASE/discovery.log" 2>&1
