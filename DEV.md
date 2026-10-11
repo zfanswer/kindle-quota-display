@@ -17,12 +17,12 @@
 | 文件 | 职责 | 修改时要一起检查 |
 | --- | --- | --- |
 | `quota_display/model.py` | CLI payload → 白名单 snapshot；有限数值、时间、窗口及状态校验 | Schema、fixture、失败缓存及 HTTP 二次过滤 |
-| `quota_display/collector.py` | 有界 CLI 子进程、每源超时、锁、独立失败、原子写入 | CodexBar source/字段、stdout 上限、进程清理、退出码 |
+| `quota_display/collector.py` | 有界 CLI 子进程、每源来源/间隔/超时、锁、独立失败、原子写入 | CodexBar source/字段、stdout 上限、进程清理、退出码 |
 | `quota_display/render.py` | 1072×1448 中文 L8 图片、卡片、16 灰阶、固定时间 | PNG 校验、字体选择、第三窗口及无数据布局 |
-| `quota_display/server.py` | 只读额度/图片 HTTP；分钟缓存；固定设备遥测 | 路由、响应大小、no-store、遥测白名单与枚举 |
+| `quota_display/server.py` | 只读额度/图片 HTTP；分钟缓存；固定设备遥测 | 路由、响应大小、no-store、遥测白名单与枚举、每连接线程及缓存/遥测锁 |
 | `kindle/common.sh` | 严格配置、下载/probe、PNG 校验、Wi-Fi 状态、RTC、遥测 | 不执行配置文本、BusyBox 兼容、恢复原状态 |
 | `kindle/find-server.sh` | 自动已知地址探测、手动有界私有子网发现、身份匹配、缓存 | CIDR 边界、预算、缓存失效、公网拒绝 |
-| `kindle/quota-dashboard.sh` | 生命周期、绘图、RTC 循环、早醒继续与停止清理 | 锁与 PID 归属、Wi-Fi/屏保、其他 RTC alarm |
+| `kindle/quota-dashboard.sh` | 生命周期、绘图、RTC 循环、早醒即停止与停止清理 | 锁与 PID 归属、Wi-Fi/屏保、其他 RTC alarm |
 | `kindle/bootstrap.sh` | 设备能力自检（不要求Mac在线）、启用休眠、启动循环 | 已运行幂等、配置修改、设备能力与状态恢复 |
 | `kindle/documents/*.sh` | Scriptlet 用户入口和安装钩子 | `Name`、`DontUseFBInk`、`UseHooks`、日志方式 |
 | `scripts/prepare.py` | 只生成 plist 或 Kindle 包与 manifest | 绝对路径、输出范围、参数、默认值 |
@@ -34,7 +34,9 @@ Docker Compose 的服务名为 `eink-dashboard`，镜像由本项目 `Dockerfile
 ## 数据不变量
 
 - Provider 固定为 `codex`、`claude`，各一个当前默认账户。增删 Provider 不能只改配置，需要同步 model、collector、renderer、Schema、tests 和布局。
-- CLI 固定 `usage --provider … --source oauth --format json --no-credits`。不要为了“跑通”扩大为 `auto`、web 或任意 source。
+- CLI 固定 `usage --provider … --source <来源> --format json --no-credits`，来源按 Provider 写死：Codex 为 `oauth`，Claude 为 `cli`（CodexBar 对它报告的来源标签是 `claude`）。Claude Code 2.1.x 只把凭据放在钥匙串，CodexBar 默认不再读取，Claude 的 oauth 会报找不到凭据；`cli` 由已登录的 Claude Code 自己认证。不要为了“跑通”扩大为 `auto`、web 或任意 source。
+- 每源有最小采集间隔（默认 Codex 300 秒、Claude 900 秒；Claude 每次会启动完整的 Claude Code 进程）。未到间隔的源原样保留上一行，包括 attempted_at；失败的源下一轮即重试。launchd 任务用默认优先级：设为 Background 时 Claude Code 启动约 42 秒（正常约 12 秒），会超过每源超时。过期阈值是默认间隔的 3 倍，写在 renderer 中，改默认间隔时一起改。
+- 不要读取 CodexBar App 的 Group Container（如 `widget-snapshot.json`）来复用它的刷新结果：macOS 对每个新进程都会弹出“访问其他 App 的数据”授权，定时任务无法使用。
 - 读取 CodexBar 的 `usage.primary/secondary/tertiary`，将 `usedPercent` 转为 `remaining_percent=max(0,100-used)`，`resetsAt` 转为 `reset_at`；合成占位窗口不显示。
 - `attempted_at`、`last_success_at`、`sampled_at` 含义不同。失败不刷新成功数据的时间，另一源继续处理。
 - 无成功数据用通用 fallback，不添加订阅状态判断或 `disabled_providers`。
@@ -82,12 +84,12 @@ python scripts/render-previews.py
 - PW3 1072×1448 是当前唯一适配目标；换分辨率须同时改 renderer 和 `common.sh valid_png`。
 - Scriptlets 需要支持 hooks；主入口文件只有函数定义，普通 `sh entry.sh` 不会自动调用 `on_run`。
 - 主入口自检通过后将 `ALLOW_SUSPEND=0` 改为 1。若要支持 Wi-Fi 常开模式，需调整 bootstrap 的策略，不能只改配置或删掉关无线语句。
-- 省电模式每轮关闭无线、RTC休眠；正常3分钟，连续失败每次加3分钟至15分钟。下一轮有30秒共享网络预算和IPv4就绪判断/已知地址短重试，不自动扫描子网。
+- 省电模式每轮关闭无线、RTC休眠；默认正常3分钟，连续失败每次加一个INTERVAL（至少3分钟）至15分钟，且不短于INTERVAL。下一轮有30秒共享网络预算和IPv4就绪判断/已知地址短重试，不自动扫描子网。
 - 其他进程占用 wakealarm 时不能覆盖；RTC 设备/epoch 支持按实际驱动核验。
-- 早醒只记录为resumed/early_wake，不自动退出。恢复屏保保护、按需重画缓存；无线关闭的20秒短交互后，按硬件RTC截止时间重挂起剩余计划。60秒内3次立即返回或硬件计时异常保护性退出。停止入口可中断等待并恢复原状态，电源键不用于退出循环。
+- 早于RTC截止时间2秒以上返回（电源键、USB或其他唤醒源，含立即返回）视为用户取回设备：记录resumed/early_wake后以stopped/early_wake退出，恢复原无线/屏保，不重画、不再挂起。曾经的“20秒交互后重新挂起”会让设备在用户操作中途失去响应，已移除。停止标记在worker退出后保留，安装钩子（--auto）见到标记不重画也不启动，只有显式start清除。
 - 固定事件同时写入设备lifecycle.log，达到256KiB时轮换为lifecycle.previous.log；日志在服务器不可达时也保留，不含原始CLI/HTTP数据。
 - 临时恢复入口成功绘图两次后删除；Library 重新索引可能滞后。正常操作用四个永久入口。
-- 启动先显示最近成功frame.png，无有效缓存则显示固定“正在刷新quota信息”，再联网；已有worker也可恢复画面。show-cache不改Wi-Fi/RTC/进程状态，占位不提交为真实缓存；/tmp不保证跨重启。
+- 启动先显示最近成功frame.png，无有效缓存则显示固定“正在刷新quota信息”，再联网；已有worker也可恢复画面。首轮之后worker会等8秒再show-cache一次，因为入口返回时Library的重绘会盖住首帧。show-cache不改Wi-Fi/RTC/进程状态，占位不提交为真实缓存；/tmp不保证跨重启。
 - 固定资产在kindle/assets/bootstrap-frame.png，部署到同名设备路径；refresh-v1标记使旧版额度快照被忽略。可用`python -m quota_display.render --placeholder --output kindle/assets/bootstrap-frame.png`重建，不接受quota输入或时间参数。
 - 绘图与成功缓存提交由同一display-lock保护，预览不能在新图绘制与提交之间重绘旧图；生命周期锁与绘图锁各司其职。
 - 自动只探测缓存/IP/主机名；手动扫描限制实际私有 `/22` 至 `/30`；SERVER_ID 是身份标记而非认证。活动worker的rediscover请求有ID/ready握手，不能用信号单独唤醒mem。

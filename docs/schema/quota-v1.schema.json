@@ -55,7 +55,10 @@
           ]
         },
         "source": {
-          "const": "oauth"
+          "enum": [
+            "oauth",
+            "cli"
+          ]
         },
         "status": {
           "enum": [

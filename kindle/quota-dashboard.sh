@@ -49,7 +49,13 @@ next_delay() {
     if [ "$1" = success ]; then FAILURES=0; NEXT_DELAY=$INTERVAL
     else
         [ "$FAILURES" -ge 5 ] || FAILURES=$((FAILURES + 1))
-        NEXT_DELAY=$((FAILURES * 180))
+        # Back off in steps of the refresh interval (at least 3 minutes) up to
+        # 15 minutes, and never retry sooner than a successful round would.
+        backoff_step=$INTERVAL
+        [ "$backoff_step" -ge 180 ] || backoff_step=180
+        NEXT_DELAY=$((FAILURES * backoff_step))
+        [ "$NEXT_DELAY" -le 900 ] || NEXT_DELAY=900
+        [ "$NEXT_DELAY" -ge "$INTERVAL" ] || NEXT_DELAY=$INTERVAL
     fi
 }
 refresh() {
@@ -107,44 +113,33 @@ rtc_now() {
 }
 rtc_wait() {
     [ -w "$POWER" ] || { STOP_REASON=rtc_unavailable; return 1; }
-    remaining=$NEXT_DELAY; rapid=0; rapid_start=0
-    while [ "$remaining" -gt 0 ]; do
-        [ ! -f "$STATE/stop" ] || return 0
-        pending_request && return 0
-        arm_rtc "$remaining" || { STOP_REASON=rtc_invalid_alarm; return 1; }
-        deadline=$ALARM
-        suspend_started=$(rtc_now) || { STOP_REASON=rtc_unavailable; return 1; }
-        report suspend_armed
-        bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable 0 || return 1
-        NETWORK_OK=0
-        bounded 10 sync || { STOP_REASON=suspend_failed; return 1; }
-        printf 'mem\n' > "$POWER" || { STOP_REASON=suspend_failed; return 1; }
-        resumed_at=$(rtc_now) || { STOP_REASON=suspend_failed; return 1; }
-        clear_rtc
-        elapsed=$((resumed_at - suspend_started))
-        [ "$elapsed" -ge 0 ] || { STOP_REASON=suspend_failed; return 1; }
-        bounded 3 lipc-set-prop com.lab126.powerd preventScreenSaver 1 || return 1
-        [ ! -f "$STATE/stop" ] || return 0
-        pending_request && return 0
-        remaining=$((deadline - resumed_at))
-        if [ "$remaining" -le 0 ]; then report resumed; return 0; fi
+    [ ! -f "$STATE/stop" ] || return 0
+    pending_request && return 0
+    arm_rtc "$NEXT_DELAY" || { STOP_REASON=rtc_invalid_alarm; return 1; }
+    deadline=$ALARM
+    suspend_started=$(rtc_now) || { STOP_REASON=rtc_unavailable; return 1; }
+    report suspend_armed
+    bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable 0 || return 1
+    NETWORK_OK=0
+    bounded 10 sync || { STOP_REASON=suspend_failed; return 1; }
+    printf 'mem\n' > "$POWER" || { STOP_REASON=suspend_failed; return 1; }
+    resumed_at=$(rtc_now) || { STOP_REASON=suspend_failed; return 1; }
+    clear_rtc
+    elapsed=$((resumed_at - suspend_started))
+    [ "$elapsed" -ge 0 ] || { STOP_REASON=suspend_failed; return 1; }
+    [ ! -f "$STATE/stop" ] || return 0
+    pending_request && return 0
+    if [ "$((deadline - resumed_at))" -gt 2 ]; then
+        # Woken before the alarm: the power button, USB, or another wake source.
+        # The user is taking the device back, so stop instead of suspending under
+        # their fingers; the marker keeps install hooks from restarting the loop.
         report resumed early_wake
-        if [ "$elapsed" -le 2 ]; then
-            if [ "$rapid" -eq 0 ] || [ "$((resumed_at - rapid_start))" -gt 60 ]; then rapid=0; rapid_start=$resumed_at; fi
-            rapid=$((rapid + 1))
-            [ "$rapid" -lt 3 ] || { STOP_REASON=suspend_failed; return 1; }
-        else rapid=0; fi
-        "$BASE/quota-dashboard.sh" show-cache || true
-        # A short local window permits Library actions; wireless stays off.
-        interaction=20
-        [ "$remaining" -ge "$interaction" ] || interaction=$remaining
-        pause "$interaction"
-        [ ! -f "$STATE/stop" ] || return 0
-        pending_request && return 0
-        resumed_at=$(rtc_now) || { STOP_REASON=suspend_failed; return 1; }
-        remaining=$((deadline - resumed_at))
-        # Rearm only the remaining plan; never sleep for the long backoff.
-    done
+        STOP_REASON=early_wake
+        : > "$STATE/stop"
+        return 0
+    fi
+    bounded 3 lipc-set-prop com.lab126.powerd preventScreenSaver 1 || return 1
+    report resumed
 }
 cleanup() {
     cancel_command
@@ -158,7 +153,9 @@ cleanup() {
     case "${SCREENSAVER_PREVIOUS:-}" in 0|1) bounded 3 lipc-set-prop com.lab126.powerd preventScreenSaver "$SCREENSAVER_PREVIOUS" >/dev/null 2>&1 || true;; esac
     wifi_restore
     printf 'stopped\n' > "$STATE/status"
-    rm -f "$STATE/pid" "$STATE/ready" "$STATE/stop" "$STATE/frame.next.png" "$STATE/server.next" "$STATE/wifi-address"
+    # The stop marker outlives the worker: it keeps install hooks from
+    # restarting the loop and is cleared only by an explicit start.
+    rm -f "$STATE/pid" "$STATE/ready" "$STATE/frame.next.png" "$STATE/server.next" "$STATE/wifi-address"
     rmdir "$STATE/lock" 2>/dev/null || true
 }
 owned_pid() {
@@ -215,10 +212,21 @@ case "$ACTION" in
         wifi_capture || exit 1
         bounded 3 lipc-set-prop com.lab126.powerd preventScreenSaver 1 || exit 1
         printf '%s\n' "$$" > "$STATE/ready.next"; mv "$STATE/ready.next" "$STATE/ready"
+        settled=0
         while [ ! -f "$STATE/stop" ]; do
             round
             [ ! -f "$STATE/stop" ] || break
             pending_request && continue
+            if [ "$settled" -eq 0 ]; then
+                # The Library repaints itself after the launcher entry returns,
+                # often just after the first frame was drawn. Let it finish, then
+                # put the dashboard back before the device sleeps under it.
+                settled=1
+                pause 8
+                [ ! -f "$STATE/stop" ] || break
+                pending_request && continue
+                "$BASE/quota-dashboard.sh" show-cache || true
+            fi
             if [ "$ALLOW_SUSPEND" -eq 1 ]; then
                 rtc_wait || { report preflight_failed "$STOP_REASON"; exit 1; }
             else

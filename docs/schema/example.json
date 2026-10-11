@@ -29,7 +29,7 @@
     },
     "claude": {
       "name": "CLAUDE CODE",
-      "source": "oauth",
+      "source": "cli",
       "status": "ok",
       "attempted_at": "2026-10-07T12:00:00Z",
       "last_success_at": "2026-10-07T12:00:00Z",

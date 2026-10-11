@@ -23,7 +23,7 @@ mkdir -p runtime
 python -m quota_display.collector --cli "$(command -v codexbar)"
 ```
 
-只保存标准化runtime/quota.json。检查每源status、sampled_at、remaining_percent和reset_at，与CodexBar相同账户对照。至少一个目标源正常即可开始显示；未取得额度的源验证暂无数据fallback。任意源失败时退出1，但完整snapshot仍写入。
+只保存标准化runtime/quota.json。检查每源status、sampled_at、remaining_percent和reset_at，与CodexBar相同账户对照。Claude需要`claude`在PATH中且已登录，单次约十余秒；重复运行时未到采集间隔的源显示为`ok:kept`，不会重新采集。至少一个目标源正常即可开始显示；未取得额度的源验证暂无数据fallback。任意源失败时退出1，但完整snapshot仍写入。
 
 认证/Keychain提示由账户所有者通过CodexBar或Provider既有登录流程处理，不导出Auth、token、cookie或原始usage JSON。账户切换时先停采集任务，将旧runtime/quota.json移到忽略的本地备份，再采集，避免跨账户使用旧额度。
 
@@ -79,7 +79,7 @@ launchctl kickstart "gui/$(id -u)/com.eink-quota.collector"
 launchctl print "gui/$(id -u)/com.eink-quota.collector"
 ```
 
-已存在同名job时先bootout旧job，再bootstrap；不要重复安装。观察至少三轮attempted_at推进、没有重叠。每源失败不阻止下一次180秒调度；StartInterval不保证严格实时或宿主机休眠时执行。移动仓库/删除虚拟环境后需重新生成plist。
+已存在同名job时先bootout旧job，再bootstrap；不要重复安装。观察至少三轮attempted_at推进、没有重叠。每源失败不阻止下一次300秒调度，失败的源下一轮即重试，成功的源到自己的采集间隔才重新采集；StartInterval不保证严格实时或宿主机休眠时执行。移动仓库/删除虚拟环境后需重新生成plist。
 
 Linux需自行配置systemd timer/cron，保留每次单次调用、绝对路径和防重叠行为；本库未提供或验证Linux定时部署。
 
@@ -99,7 +99,7 @@ python scripts/prepare.py kindle \
 
 包内有四个内部脚本、配置、五个Library入口及固定bootstrap-frame.png，manifest包含占位图SHA256。占位图仅显示“正在刷新quota信息”，无有效缓存时使用；旧版同名额度快照缺少标记会被忽略。更新时将固定图和脚本一起部署，不能只复制旧额度截图作为占位图。
 
-**安装钩子可能在首次索引入口后自动自检并启用RTC循环。** 点击主入口也会自检后将ALLOW_SUSPEND改为1；不要把模板中的0理解为正常启动后一定不休眠。事先确认RTC/sysfs能力、无其他dashboard占用alarm，以及停止方法。
+**安装钩子可能在首次索引入口后自动自检并启用RTC循环。** 入口文件被USB更新重写后同样会触发；若此前点过“停止 Agent 额度”，钩子不会重画或启动，需手动点“开启Agent额度”。 点击主入口也会自检后将ALLOW_SUSPEND改为1；不要把模板中的0理解为正常启动后一定不休眠。事先确认RTC/sysfs能力、无其他dashboard占用alarm，以及停止方法。
 
 ## 6. USB安装与推出
 
@@ -131,7 +131,7 @@ python scripts/install-kindle.py --bundle build/kindle-install --mount /Volumes/
 - 点击“刷新 Agent 额度”做单次刷新；已有循环持锁时拒绝并发，先停止再测试。
 - 点击“开启Agent额度”先显示最近成功缓存，无有效缓存时显示固定刷新占位，再做设备能力检查并启动；已有循环只恢复画面。占位图不含额度/时间，不作为成功数据缓存；坏缓存或占位图不阻塞联网。
 - 观察在线frame_ok、suspend_armed及后续frame_ok；resumed通常仅写Kindle本地日志；肉眼核对方向、中文、数据和残影。
-- 点击“停止 Agent 额度”退出，确认Wi-Fi/屏保恢复并可正常阅读；电源键/其他提前唤醒不停止循环，保持无线关闭，短交互后以剩余RTC等待继续。
+- 点击“停止 Agent 额度”退出，确认Wi-Fi/屏保恢复并可正常阅读；休眠期间按电源键或插USB等提前唤醒同样会停止循环并恢复原状态，之后需手动点“开启Agent额度”。
 
 在已有设备终端中可检查：
 
@@ -143,7 +143,7 @@ cat /mnt/us/eink-dashboard/lifecycle.log
 cat /mnt/us/eink-dashboard/power.log
 ```
 
-不为调试临时安装SSH。USB可回读eink-dashboard持久日志；/tmp/kindle-quota-display是设备临时状态。发现失败用discovery.log，启动自检用bootstrap.log。lifecycle.log记录固定事件和系统epoch，不依赖服务器可达，达到256KiB时轮换为lifecycle.previous.log。resumed/early_wake表示提前返回且继续任务；stopped才表示退出。power.log记录每轮失败计数和下一间隔。离线、返回和停止事件通常只写本地，不因回报重新打开无线。
+不为调试临时安装SSH。USB可回读eink-dashboard持久日志；/tmp/kindle-quota-display是设备临时状态。发现失败用discovery.log，启动自检用bootstrap.log。lifecycle.log记录固定事件和系统epoch，不依赖服务器可达，达到256KiB时轮换为lifecycle.previous.log。resumed/early_wake表示提前返回，其后紧跟stopped/early_wake表示循环因此退出。power.log记录每轮失败计数和下一间隔。离线、返回和停止事件通常只写本地，不因回报重新打开无线。
 
 观察工具只读服务器事件：
 
@@ -158,11 +158,11 @@ python scripts/observe-kindle.py --url http://127.0.0.1:8486 \
 
 按[模板](acceptance-record.md)建立本地记录，至少验证：
 
-1. Mac服务离线时保留旧图，观察失败后RTC间隔3→6→9→12→15分钟；已知地址恢复后最多额外等待15分钟，成功清零。collector停止但HTTP在线时，10分钟后生成过期状态；旧离线PNG不能自行改字。
+1. Mac服务离线时保留旧图，观察失败后RTC间隔3→6→9→12→15分钟（INTERVAL=300时为5→10→15分钟）；已知地址恢复后最多额外等待15分钟，成功清零。collector停止但HTTP在线时，Codex 15分钟、Claude 45分钟后生成过期状态；旧离线PNG不能自行改字。
 2. DHCP变化或换Wi-Fi后，主机名有效时可自动恢复；否则点击“重找额度服务器”，后台永不扫描。固定Host绑定需更新，0.0.0.0不需要。
 3. 手工“重找额度服务器”跳过缓存、保存新地址并尝试刷新；已有循环活动时通过请求跳过退避并立即尝试刷新。
 4. /21及更大网段、/31、/32或公网不自动扫描，通过固定IP/主机名配置；mDNS和AP隔离需环境验证。
-5. 至少一小时连续自动循环、30分钟full refresh、停止恢复和提前唤醒继续刷新。提前唤醒后应有后续frame_ok，无stopped；实际退出后不能将两段会话累加成一次不中断成功。
+5. 至少一小时连续自动循环、30分钟full refresh、停止恢复和提前唤醒即停止。提前唤醒后设备日志应有resumed/early_wake和stopped/early_wake，设备保持可操作且不再自动休眠；实际退出后不能将两段会话累加成一次不中断成功。
 
 30秒网络窗口与IPv4/已知地址短重试需要按实际AP验证，详情见[电源行为](power-management.md)。锁存在但无活动进程时，先核对status/PID，确认无refresh/run再处理遗留锁，不能删除活动锁。
 

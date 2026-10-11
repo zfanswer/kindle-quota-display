@@ -1,14 +1,17 @@
 import copy
 import fcntl
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
 import os
 import plistlib
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from datetime import timedelta
@@ -18,8 +21,8 @@ from PIL import Image, ImageDraw
 
 from quota_display.collector import CollectionError, atomic_write, collect, read_snapshot, run_cli
 from quota_display.model import PayloadError, normalize, timestamp, validate_snapshot
-from quota_display.render import frame, placeholder_frame
-from quota_display.server import Dashboard, handler
+from quota_display.render import frame, labels, placeholder_frame
+from quota_display.server import Dashboard, handler, make_server
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = timestamp("2026-10-07T12:00:00Z")
@@ -166,6 +169,17 @@ class PipelineTests(unittest.TestCase):
             normalize(raw, "codex", NOW)
         with self.assertRaises(PayloadError):
             normalize(fixture("codex") * 2, "codex", NOW)
+        # Claude is collected through Claude Code; CodexBar labels that source "claude".
+        raw = fixture("claude")
+        self.assertEqual(normalize(raw, "claude", NOW)["source"], "cli")
+        self.assertEqual(normalize(fixture("codex"), "codex", NOW)["source"], "oauth")
+        raw[0]["source"] = "oauth"
+        with self.assertRaisesRegex(PayloadError, "source_mismatch"):
+            normalize(raw, "claude", NOW)
+        legacy = good()
+        legacy["providers"]["claude"]["source"] = "oauth"
+        with self.assertRaises(PayloadError):
+            validate_snapshot(legacy)
 
     def test_invalid_and_future_timestamps(self):
         for value in ("2026-10-07T12:00:00", "nonsense", "2026-10-07T13:00:00Z", None):
@@ -173,6 +187,22 @@ class PipelineTests(unittest.TestCase):
             raw[0]["usage"]["updatedAt"] = value
             with self.subTest(value=value), self.assertRaises(PayloadError):
                 normalize(raw, "codex", NOW)
+
+    def test_out_of_range_timestamps_fail_one_provider_only(self):
+        for value in ("0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59", "9999-12-31T20:00:00Z"):
+            def runner(_, pid, timeout, value=value):
+                raw = fixture(pid)
+                if pid == "codex":
+                    raw[0]["usage"]["primary"]["resetsAt"] = value
+                return raw
+            with self.subTest(value=value):
+                data = collect(None, runner, now=NOW)
+                self.assertEqual(data["providers"]["codex"]["error_code"], "invalid_payload")
+                self.assertEqual(data["providers"]["claude"]["status"], "ok")
+                stored = good()
+                stored["providers"]["codex"]["windows"][0]["reset_at"] = value
+                with self.assertRaises(PayloadError):
+                    validate_snapshot(stored)
 
     def test_partial_failure_keeps_original_sample_time(self):
         prior = good()
@@ -207,6 +237,80 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(data["providers"]["claude"]["attempted_at"], "2026-10-07T12:00:46Z")
         self.assertEqual(data["providers"]["claude"]["last_success_at"], "2026-10-07T12:01:30Z")
         self.assertEqual(data["updated_at"], "2026-10-07T12:01:31Z")
+
+    def test_each_provider_is_collected_at_its_own_interval(self):
+        intervals = {"codex": 300, "claude": 900}
+        calls = []
+        def runner(_, pid, timeout):
+            calls.append(pid)
+            raw = fixture(pid)
+            raw[0]["usage"]["updatedAt"] = "2026-10-07T12:00:00Z"
+            return raw
+        def later(previous, seconds, run=runner):
+            calls.clear()
+            return collect(previous, run, now=NOW + timedelta(seconds=seconds), intervals=intervals)
+        first = later(None, 0)
+        self.assertEqual(calls, ["codex", "claude"])
+        kept = later(first, 200)
+        self.assertEqual(calls, [])
+        self.assertEqual(kept["providers"], first["providers"])
+        self.assertEqual(kept["updated_at"], "2026-10-07T12:03:20Z")
+        # A run within 60 seconds of the interval counts as due.
+        second = later(first, 245)
+        self.assertEqual(calls, ["codex"])
+        self.assertEqual(second["providers"]["claude"], first["providers"]["claude"])
+        self.assertEqual(second["providers"]["codex"]["attempted_at"], "2026-10-07T12:04:05Z")
+        self.assertEqual(later(second, 845)["providers"]["claude"]["attempted_at"], "2026-10-07T12:14:05Z")
+        self.assertEqual(calls, ["codex", "claude"])
+        # A failed provider keeps its old windows and is retried on the very next run.
+        def fail(*args):
+            calls.append(args[1])
+            raise CollectionError("timeout")
+        failed = later(first, 900, fail)
+        self.assertEqual(len(failed["providers"]["claude"]["windows"]), 2)
+        recovered = later(failed, 960)
+        self.assertEqual(calls, ["codex", "claude"])
+        self.assertEqual(recovered["providers"]["claude"]["status"], "ok")
+        # A clock that moved backwards must not postpone collection indefinitely.
+        later(first, -3600)
+        self.assertEqual(calls, ["codex", "claude"])
+
+    def test_collector_cli_sources_config_and_intervals_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            exe = tmp / "fake-cli"
+            # Echo the fixture only for the exact fixed command of each provider.
+            exe.write_text(f'''#!/bin/sh
+echo "$*" >> "{tmp}/calls"
+case "$*" in
+  "usage --provider codex --source oauth --format json --no-credits") cat "{ROOT}/tests/fixtures/codex.json";;
+  "usage --provider claude --source cli --format json --no-credits") cat "{ROOT}/tests/fixtures/claude.json";;
+  *) exit 2;;
+esac
+''')
+            exe.chmod(0o755)
+            config = {"providers": ["codex", "claude"], "sources": {"codex": "oauth", "claude": "cli"},
+                      "interval_seconds": {"codex": 300, "claude": 900}, "timeout_seconds": 30}
+            def run(config, *args):
+                (tmp / "config.json").write_text(json.dumps(config))
+                return subprocess.run([sys.executable, "-m", "quota_display.collector", "--config", str(tmp / "config.json"),
+                                       "--output", str(tmp / "quota.json"), *args], cwd=ROOT, capture_output=True)
+            result = run(config, "--cli", str(exe))
+            self.assertEqual((result.returncode, result.stdout), (0, b"codex=ok claude=ok\n"), result.stderr)
+            stored = read_snapshot(tmp / "quota.json")
+            self.assertEqual({pid: p["source"] for pid, p in stored["providers"].items()}, {"codex": "oauth", "claude": "cli"})
+            result = run(config, "--cli", str(exe))
+            self.assertEqual((result.returncode, result.stdout), (0, b"codex=ok:kept claude=ok:kept\n"))
+            self.assertEqual(read_snapshot(tmp / "quota.json")["providers"], stored["providers"])
+            self.assertEqual(len((tmp / "calls").read_text().splitlines()), 2)
+            # Fixtures ignore intervals; anything but the fixed sources and bounded intervals is rejected.
+            offline = ("--fixture-dir", "tests/fixtures", "--fixture-now", "2026-10-07T12:00:00Z")
+            self.assertEqual(run(config, *offline).stdout, b"codex=ok claude=ok\n")
+            for bad in ({"sources": {"codex": "oauth", "claude": "oauth"}}, {"sources": None, "source": "oauth"},
+                        {"interval_seconds": {"codex": 30, "claude": 900}}, {"interval_seconds": {"codex": 300}},
+                        {"interval_seconds": {"codex": True, "claude": 900}}):
+                with self.subTest(bad=bad):
+                    self.assertEqual(run({**config, **bad}, *offline).returncode, 2)
 
     def test_atomic_snapshot_and_http_allowlist(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +358,24 @@ class PipelineTests(unittest.TestCase):
         handler(app)(request, ("127.0.0.1", 1234), None)
         self.assertIn(b"404", request.output.split(b"\r\n", 1)[0])
 
+    def test_idle_connection_does_not_delay_health_probe(self):
+        try:
+            server = make_server(Dashboard(Path("missing-snapshot")), "127.0.0.1", 0)
+        except OSError as exc:
+            self.skipTest(f"loopback listener unavailable: {exc}")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                # The Kindle probe allows one second for the whole request.
+                probe = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                probe.request("GET", "/healthz")
+                self.assertEqual(probe.getresponse().read(), b"EINK_QUOTA_V1\nSERVER_ID=kqd-pw3\n")
+                probe.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_device_telemetry_rejects_commands_and_never_changes_quota(self):
         app = Dashboard(Path("missing-snapshot"))
         body = {"stage": "frame_ok", "reason": "none", "interval": 180, "cycles": 1}
@@ -277,6 +399,39 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(image.size, (1072, 1448))
             self.assertEqual(image.mode, "L")
             self.assertLessEqual(len(image.getcolors()), 16)
+
+    def test_windows_of_equal_length_get_distinct_labels(self):
+        def named(*lanes):
+            return labels([{"id": slot, "window_minutes": minutes} for slot, minutes in lanes])
+        self.assertEqual(named(("primary", 300), ("secondary", 10080), ("tertiary", 10080)),
+                         ["5小时额度", "每周额度", "每周额度 · 第三窗口"])
+        self.assertEqual(named(("primary", 300), ("secondary", 10080), ("tertiary", None)), ["5小时额度", "每周额度", "第三窗口"])
+        self.assertEqual(named(("primary", 300), ("secondary", 300)), ["5小时额度", "5小时额度 · 第二窗口"])
+        data = good()
+        data["providers"]["claude"]["windows"].append({"id": "tertiary", "used_percent": 88, "remaining_percent": 12,
+                                                        "window_minutes": 10080, "reset_at": None})
+        same_length = Image.open(io.BytesIO(frame(data, NOW)))
+        data["providers"]["claude"]["windows"][2]["window_minutes"] = None
+        self.assertNotEqual(same_length.tobytes(), Image.open(io.BytesIO(frame(data, NOW))).tobytes())
+
+    def test_stale_limit_is_three_collection_intervals_per_provider(self):
+        def state_changes(minutes):
+            # Samples are at 11:59:00 (Codex) and 11:59:20 (Claude).
+            return frame(good(), NOW + timedelta(minutes=minutes)) != frame(good(), NOW + timedelta(minutes=minutes - 1))
+        self.assertEqual([m for m in range(1, 50) if state_changes(m)], [14, 45])
+
+    def test_launchd_plist_runs_every_five_minutes(self):
+        (ROOT / "build").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+            output = Path(tmp) / "collector.plist"
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/prepare.py"), "launchd", "--python", sys.executable,
+                                     "--cli", sys.executable, "--output", str(output)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plist = plistlib.loads(output.read_bytes())
+            self.assertEqual(plist["StartInterval"], 300)
+            # Background throttling makes the Claude Code launch outlast the collection timeout.
+            self.assertFalse({"ProcessType", "LowPriorityIO"} & set(plist))
+            self.assertIn("--cli", plist["ProgramArguments"])
 
     def test_cli_timeout_exit_and_output_limits_with_fake_program(self):
         with tempfile.TemporaryDirectory() as tmp:

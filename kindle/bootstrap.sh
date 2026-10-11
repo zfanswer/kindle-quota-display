@@ -5,6 +5,12 @@ BASE=${KQD_BASE:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 mkdir -p "$STATE"
 trap cancel_command 0
 trap 'exit 1' 1 2 15
+# Install hooks pass --auto. After an explicit stop they must neither redraw
+# the dashboard over the Library nor restart the loop; only a tap does that.
+if [ "${1:-}" = --auto ] && [ -f "$STATE/stop" ]; then
+    echo 'Stopped by user; the install hook does not restart the dashboard'
+    exit 0
+fi
 # Cover the Library immediately with the latest successfully committed frame,
 # even when the worker is already running; use the fixed message if no cache.
 "$BASE/quota-dashboard.sh" show-cache || true

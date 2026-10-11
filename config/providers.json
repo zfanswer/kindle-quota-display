@@ -1,5 +1,6 @@
 {
   "providers": ["codex", "claude"],
-  "source": "oauth",
+  "sources": {"codex": "oauth", "claude": "cli"},
+  "interval_seconds": {"codex": 300, "claude": 900},
   "timeout_seconds": 30
 }

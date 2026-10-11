@@ -12,14 +12,14 @@
 | --- | --- |
 | Kindle | 已自行完成 **Jailbreak**，可通过 **Scriptlets** 运行 `documents/*.sh`，已安装支持 PNG 的 **FBInk** |
 | 已适配设备 | Paperwhite 3（PW3），竖屏 **1072 × 1448**；其他型号需要修改渲染、PNG 校验及电源适配并重新验收 |
-| 采集宿主机 | 已安装 **CodexBar CLI**，并通过它所支持的登录方式取得目标 Provider 的 OAuth 额度访问能力 |
+| 采集宿主机 | 已安装 **CodexBar CLI**；Codex 通过它的 OAuth 来源取得额度，Claude 通过本机已登录的 **Claude Code**（`claude` 在 PATH 中）取得额度 |
 | Python | Python **3.12** 为已测试版本；本地预览/测试需安装 `requirements.txt` 中的 Pillow 和中文字体 |
 | 图片服务 | Docker Engine/Desktop 与 Docker Compose；容器只运行本项目的图片/HTTP 服务，不安装 CodexBar、不挂载账户凭据 |
 | 网络 | Kindle 与服务器在可互访的局域网；访客 Wi-Fi、AP 隔离、宿主机休眠或 Docker 未运行会影响刷新 |
 
 本项目**不负责 Jailbreak、Hotfix、Scriptlets、FBInk 或账户登录的安装**。请按 [KindleModding](https://kindlemodding.org/) 的设备/固件说明自行准备；Scriptlets 入口规范见[文档](https://kindlemodding.org/kindle-dev/scriptlets.html)，FBInk 见[上游项目](https://github.com/NiLuJe/FBInk)。
 
-CodexBar CLI 的安装方式见[官方 CLI 文档](https://github.com/steipete/CodexBar/blob/main/docs/cli.md)。只安装菜单栏 App 不代表命令已在 PATH 中，请确认 `codexbar --version` 可运行。本项目显式使用 `--source oauth`；CodexBar 的其他数据源和 Provider 并不会自动被本项目支持。
+CodexBar CLI 的安装方式见[官方 CLI 文档](https://github.com/steipete/CodexBar/blob/main/docs/cli.md)。只安装菜单栏 App 不代表命令已在 PATH 中，请确认 `codexbar --version` 可运行。本项目对 Codex 显式使用 `--source oauth`，对 Claude 显式使用 `--source cli`（由已登录的 Claude Code 自己完成认证；Claude Code 2.1.x 只把凭据放在钥匙串，CodexBar 默认不再读取，所以 Claude 的 OAuth 来源不可用）；CodexBar 的其他数据源和 Provider 并不会自动被本项目支持。
 
 完整部署路径目前以 **macOS + launchd + PW3** 为基线。Linux 可运行 Python/Docker 部分，但定时采集、CodexBar OAuth 和设备部署需要自行适配并验证；Windows 原生采集未适配。
 
@@ -27,11 +27,11 @@ CodexBar CLI 的安装方式见[官方 CLI 文档](https://github.com/steipete/C
 
 - Codex 和 Claude Code 各一个当前默认账户，每源最多三个真实额度窗口。
 - 独立处理采集失败：保留该源上次成功数据；首次无数据时显示“暂无额度数据”，不需要停用开关。
-- 默认每 **180 秒**尝试采集；Kindle 成功后待机 **180 秒**，连续失败按3分钟递增，上限15分钟，实际帧间隔还包含联网/下载时间。
+- 默认每 **300 秒**采集一次 Codex、每 **900 秒**采集一次 Claude（每次会启动 Claude Code 进程）；Kindle 成功后待机 **180 秒**，连续失败按刷新间隔（至少3分钟）递增，上限15分钟，实际帧间隔还包含联网/下载时间。
 - 默认每 **1800 秒**在下一次成功绘图时执行全屏刷新。
 - 后台只探测缓存、配置 IP 和主机名；换网或 DHCP 换 IP 后可手动“重找额度服务器”，仅手动扫描实际私有 `/22` 至 `/30`。
 - 退出后恢复启动时的 Wi-Fi/屏保状态，下载失败时保留旧画面。
-- 提前唤醒继续显示额度并等待本轮剩余间隔；回到阅读时使用“停止 Agent 额度”，电源键不作为停止指令。
+- 休眠期间按电源键（或插USB等提前唤醒）即停止循环并恢复原 Wi-Fi/屏保状态，设备可以正常使用；要继续显示额度时再点“开启Agent额度”。也可随时点“停止 Agent 额度”。
 
 **省电模式会每轮主动关闭无线、唤醒后重新开启**，因此可能看到 Wi-Fi 重连或飞行模式变化，详见[电源与网络行为](docs/power-management.md)。这不是 Wi-Fi 常连模式。
 
@@ -59,7 +59,7 @@ python -m quota_display.collector --cli "$(command -v codexbar)"
 
 标准结果写入 `runtime/quota.json`，终端只显示各源状态。任何源失败时退出码为 1，但仍写入另一源的成功数据或旧缓存；例如 Claude 尚无额度不阻塞 Codex 图片显示。认证问题应在 CodexBar/对应 Provider 的登录环境解决。
 
-不要把原始 CodexBar JSON、token、cookie 或账户配置复制到本项目。`config/providers.json` 是无个人信息的公共默认配置；个人超时配置可放入忽略的 `config/providers.local.json` 并用 `--config` 指定。
+不要把原始 CodexBar JSON、token、cookie 或账户配置复制到本项目。`config/providers.json` 是无个人信息的公共默认配置；个人间隔/超时配置可放入忽略的 `config/providers.local.json` 并用 `--config` 指定。
 
 ### 3. 启动图片服务
 
@@ -92,7 +92,7 @@ Kindle 上四个日常入口是 **开启Agent额度 / 刷新 Agent 额度 / 重�
 
 ### 5. 配置定时采集
 
-macOS 可使用 `scripts/prepare.py launchd` 生成使用绝对 Python/CLI 路径的 plist，默认 `StartInterval=180`。生成、安装、停止和回滚步骤见[手顺](docs/runbook.md)。宿主机睡眠期间不保证采集或 HTTP 可用。
+macOS 可使用 `scripts/prepare.py launchd` 生成使用绝对 Python/CLI 路径的 plist，默认 `StartInterval=300`。生成、安装、停止和回滚步骤见[手顺](docs/runbook.md)。宿主机睡眠期间不保证采集或 HTTP 可用。
 
 ## 开发与 Agent 接手
 

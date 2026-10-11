@@ -5,6 +5,13 @@ from datetime import datetime, timezone
 PROVIDERS = {"codex": "CODEX", "claude": "CLAUDE CODE"}
 SLOTS = ("primary", "secondary", "tertiary")
 ERRORS = {"timeout", "command_failed", "invalid_payload", "source_mismatch", "cli_missing", "output_limit"}
+# provider -> (CodexBar --source mode, source label CodexBar reports for that mode).
+# Claude Code 2.1.x keeps its credentials in the Keychain only and CodexBar no longer reads them by
+# default, so Claude OAuth cannot work; the cli mode lets the signed-in Claude Code authenticate itself.
+SOURCES = {"codex": ("oauth", "oauth"), "claude": ("cli", "claude")}
+# One day of headroom keeps later display-timezone conversion inside datetime's range.
+EARLIEST = datetime(1, 1, 2, tzinfo=timezone.utc)
+LATEST = datetime(9999, 12, 30, tzinfo=timezone.utc)
 
 
 class PayloadError(ValueError):
@@ -24,7 +31,13 @@ def timestamp(value):
         raise PayloadError("invalid timestamp") from exc
     if dt.tzinfo is None:
         raise PayloadError("timestamp needs timezone")
-    return dt.astimezone(timezone.utc)
+    try:
+        dt = dt.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise PayloadError("timestamp out of range") from exc
+    if not EARLIEST <= dt <= LATEST:
+        raise PayloadError("timestamp out of range")
+    return dt
 
 
 def iso(dt):
@@ -66,7 +79,8 @@ def normalize(raw, provider, now, attempted_at=None):
     row = raw[0]
     if row.get("provider") != provider or row.get("error") is not None:
         raise PayloadError("provider failed")
-    if row.get("source") != "oauth":
+    mode, reported = SOURCES[provider]
+    if row.get("source") != reported:
         raise PayloadError("source_mismatch")
     usage = row.get("usage")
     if not isinstance(usage, dict):
@@ -86,7 +100,7 @@ def normalize(raw, provider, now, attempted_at=None):
         windows.append(window(slot, lane.get("usedPercent"), lane.get("windowMinutes"), lane.get("resetsAt")))
     if not windows:
         raise PayloadError("no measured windows")
-    return {"name": PROVIDERS[provider], "source": "oauth", "status": "ok",
+    return {"name": PROVIDERS[provider], "source": mode, "status": "ok",
             "attempted_at": iso(attempted_at or now), "last_success_at": iso(now), "sampled_at": iso(sampled),
             "error_code": None, "windows": windows}
 
@@ -95,7 +109,7 @@ def failure(provider, code, now, previous=None):
     if code not in ERRORS:
         code = "invalid_payload"
     old = previous or {}
-    return {"name": PROVIDERS[provider], "source": "oauth", "status": "error",
+    return {"name": PROVIDERS[provider], "source": SOURCES[provider][0], "status": "error",
             "attempted_at": iso(now), "last_success_at": old.get("last_success_at"),
             "sampled_at": old.get("sampled_at"), "error_code": code,
             "windows": old.get("windows", [])}
@@ -116,7 +130,7 @@ def validate_snapshot(raw):
     cleaned = {}
     for pid, name in PROVIDERS.items():
         p = rows[pid]
-        if not isinstance(p, dict) or p.get("source") != "oauth" or p.get("status") not in ("ok", "error"):
+        if not isinstance(p, dict) or p.get("source") != SOURCES[pid][0] or p.get("status") not in ("ok", "error"):
             raise PayloadError("invalid provider")
         attempt = iso(timestamp(p.get("attempted_at")))
         sample = iso(timestamp(p["sampled_at"])) if p.get("sampled_at") else None
@@ -136,7 +150,7 @@ def validate_snapshot(raw):
             raise PayloadError("invalid success")
         if p["status"] == "error" and (error not in ERRORS or (windows and (not sample or not success))):
             raise PayloadError("invalid failure")
-        cleaned[pid] = {"name": name, "source": "oauth", "status": p["status"],
+        cleaned[pid] = {"name": name, "source": SOURCES[pid][0], "status": p["status"],
                         "attempted_at": attempt, "last_success_at": success,
                         "sampled_at": sample, "error_code": error, "windows": windows}
     return {"schema_version": 1, "updated_at": updated, "providers": cleaned}

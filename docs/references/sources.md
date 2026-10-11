@@ -6,6 +6,7 @@
 | --- | --- |
 | [CodexBar](https://github.com/steipete/CodexBar) / [CLI文档](https://github.com/steipete/CodexBar/blob/main/docs/cli.md) | 宿主机额度采集与认证管理；本库只调用CLI和标准化结果 |
 | [v0.72.0 CLIHelp](https://github.com/steipete/CodexBar/blob/v0.72.0/Sources/CodexBarCLI/CLIHelp.swift) / [CLIPayloads](https://github.com/steipete/CodexBar/blob/v0.72.0/Sources/CodexBarCLI/CLIPayloads.swift) / [UsageFetcher](https://github.com/steipete/CodexBar/blob/v0.72.0/Sources/CodexBarCore/UsageFetcher.swift) | 初始适配参考：OAuth来源、usage窗口、usedPercent、resetsAt、updatedAt、合成占位 |
+| [v0.74.0 Claude来源说明](https://github.com/steipete/CodexBar/blob/v0.74.0/docs/claude.md) / [钥匙串读取同意项](https://github.com/steipete/CodexBar/blob/v0.74.0/Sources/CodexBarCore/Providers/Claude/ClaudeOAuth/ClaudeOAuthDirectKeychainReadConsent.swift) / [CLI启动节流](https://github.com/steipete/CodexBar/blob/v0.74.0/Sources/CodexBarCore/Providers/Claude/ClaudeCLIUsageSpawnThrottle.swift) | Claude改用cli来源的依据：CodexBar默认不读Claude Code钥匙串凭据；900秒间隔参照其App后台15分钟下限 |
 | [KindleModding](https://kindlemodding.org/) / [Scriptlets](https://kindlemodding.org/kindle-dev/scriptlets.html) | 用户自行准备Jailbreak环境，documents入口metadata及安装/运行hooks |
 | [FBInk](https://github.com/NiLuJe/FBInk) | 用户设备上安装的图片绘制工具，PNG支持由实际构建确认 |
 | [remote-eink-dashboard](https://github.com/sep1107/remote-eink-dashboard/tree/2b12c968460ce94c5e2584c40efe02a8fd0ad14a) | Kindle联网、绘图、RTC待机流程的设计参考；本库为独立服务，不使用其镜像/服务契约 |

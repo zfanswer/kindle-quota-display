@@ -21,8 +21,9 @@ def launchd(python, cli, output):
         "Label": "com.eink-quota.collector",
         "ProgramArguments": [str(python), "-m", "quota_display.collector", "--cli", str(cli),
                              "--output", str(runtime / "quota.json"), "--config", str(ROOT / "config/providers.json")],
-        "WorkingDirectory": str(ROOT), "StartInterval": 180, "RunAtLoad": True,
-        "ProcessType": "Background", "LowPriorityIO": True,
+        "WorkingDirectory": str(ROOT), "StartInterval": 300, "RunAtLoad": True,
+        # Default priority on purpose: as a throttled Background job, starting Claude Code for the
+        # cli source took about 42s instead of 12s and exceeded the per-provider timeout.
         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
         "StandardOutPath": str(runtime / "collector.log"),
         "StandardErrorPath": str(runtime / "collector.error.log"),

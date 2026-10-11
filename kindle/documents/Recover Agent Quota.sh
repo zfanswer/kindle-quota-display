@@ -4,7 +4,7 @@
 # DontUseFBInk
 # UseHooks
 on_install() {
-    (sleep 10; /bin/sh /mnt/us/eink-dashboard/bootstrap.sh >> /mnt/us/eink-dashboard/bootstrap.log 2>&1) &
+    (sleep 10; /bin/sh /mnt/us/eink-dashboard/bootstrap.sh --auto >> /mnt/us/eink-dashboard/bootstrap.log 2>&1) &
 }
 on_run() {
     /bin/sh /mnt/us/eink-dashboard/bootstrap.sh >> /mnt/us/eink-dashboard/bootstrap.log 2>&1

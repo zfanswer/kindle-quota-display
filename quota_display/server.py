@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections import deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -16,7 +17,7 @@ from .render import frame
 
 
 class Dashboard:
-    def __init__(self, path, server_id="kqd-pw3", tz="Asia/Shanghai", stale_seconds=600):
+    def __init__(self, path, server_id="kqd-pw3", tz="Asia/Shanghai", stale_seconds=None):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", server_id):
             raise ValueError("invalid server id")
         ZoneInfo(tz)
@@ -28,6 +29,9 @@ class Dashboard:
         self.cache_png = None
         self.device_status = None
         self.device_events = deque(maxlen=128)
+        # Requests run on separate threads; healthz takes neither lock.
+        self.frame_lock = threading.Lock()
+        self.device_lock = threading.Lock()
 
     def receive_device_status(self, body, now=None):
         """Non-authoritative device telemetry; never accepts commands or quota data."""
@@ -55,8 +59,9 @@ class Dashboard:
         from .model import iso
         data["received_at"] = iso(now or utcnow())
         data["evidence"] = "device_reported"
-        self.device_status = data
-        self.device_events.append(dict(data))
+        with self.device_lock:
+            self.device_status = data
+            self.device_events.append(dict(data))
         print(json.dumps({"device_event": data}, ensure_ascii=True), flush=True)
         return 200
 
@@ -69,10 +74,12 @@ class Dashboard:
             return 200, headers, f"EINK_QUOTA_V1\nSERVER_ID={self.server_id}\n".encode()
         if path == "/api/device/kindle1":
             headers["Content-Type"] = "application/json"
-            return 200, headers, json.dumps(self.device_status or {"stage": "not_seen"}).encode()
+            with self.device_lock:
+                return 200, headers, json.dumps(self.device_status or {"stage": "not_seen"}).encode()
         if path == "/api/device/kindle1/history":
             headers["Content-Type"] = "application/json"
-            return 200, headers, json.dumps(list(self.device_events)).encode()
+            with self.device_lock:
+                return 200, headers, json.dumps(list(self.device_events)).encode()
         if path not in ("/api/quota", "/frame/kindle1.png"):
             return 404, {**headers, "Content-Type": "text/plain"}, b"Not found\n"
         data = read_snapshot(self.path)
@@ -83,12 +90,14 @@ class Dashboard:
             return 200, headers, json.dumps(data, allow_nan=False).encode()
         # Re-evaluate STALE and passed-reset state even if the data file is unchanged.
         key = (json.dumps(data, sort_keys=True), int(now.timestamp()) // 60)
-        if key != self.cache_key:
-            self.cache_png = frame(data, now.replace(second=0, microsecond=0), self.tz, self.stale_seconds)
-            self.cache_key = key
+        with self.frame_lock:
+            if key != self.cache_key:
+                self.cache_png = frame(data, now.replace(second=0, microsecond=0), self.tz, self.stale_seconds)
+                self.cache_key = key
+            png = self.cache_png
         headers["Content-Type"] = "image/png"
-        headers["ETag"] = '"' + hashlib.sha256(self.cache_png).hexdigest() + '"'
-        return 200, headers, self.cache_png
+        headers["ETag"] = '"' + hashlib.sha256(png).hexdigest() + '"'
+        return 200, headers, png
 
 
 def handler(dashboard):
@@ -137,6 +146,12 @@ def handler(dashboard):
     return Handler
 
 
+def make_server(app, host, port):
+    # One thread per connection: a stalled client must not delay the Kindle's
+    # one-second health probe. Each connection still has the 5s socket timeout.
+    return ThreadingHTTPServer((host, port), handler(app))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -144,7 +159,7 @@ def main():
     parser.add_argument("--input", type=Path, default=Path(os.environ.get("QUOTA_FILE", "runtime/quota.json")))
     args = parser.parse_args()
     app = Dashboard(args.input, os.environ.get("QUOTA_SERVER_ID", "kqd-pw3"), os.environ.get("QUOTA_TIMEZONE", "Asia/Shanghai"))
-    with HTTPServer((args.host, args.port), handler(app)) as server:
+    with make_server(app, args.host, args.port) as server:
         server.serve_forever()
 
 

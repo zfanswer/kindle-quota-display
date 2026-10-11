@@ -12,6 +12,8 @@ from .collector import read_snapshot
 from .model import PROVIDERS, timestamp, utcnow
 
 WIDTH, HEIGHT = 1072, 1448
+# Three default collection intervals (Codex 300s, Claude 900s) without a new sample.
+STALE_SECONDS = {"codex": 900, "claude": 2700}
 
 
 def placeholder_frame():
@@ -41,6 +43,9 @@ def font(size, bold=False):
     raise RuntimeError("Chinese font missing: install fonts-noto-cjk or set QUOTA_FONT and QUOTA_FONT_BOLD")
 
 
+SLOT_NAMES = {"primary": "当前会话", "secondary": "第二窗口", "tertiary": "第三窗口"}
+
+
 def label(w):
     minutes = w["window_minutes"]
     if minutes == 300:
@@ -49,10 +54,19 @@ def label(w):
         return "每周额度"
     if minutes:
         return f"{minutes}分钟额度"
-    return {"primary": "当前会话", "secondary": "第二窗口", "tertiary": "第三窗口"}[w["id"]]
+    return SLOT_NAMES[w["id"]]
 
 
-def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600, *, _refreshing=False):
+def labels(windows):
+    """Windows of equal length (an overall and a model-specific weekly limit) stay distinguishable."""
+    names = []
+    for w in windows:
+        name = label(w)
+        names.append(f"{name} · {SLOT_NAMES[w['id']]}" if name in names else name)
+    return names
+
+
+def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=None, *, _refreshing=False):
     if _refreshing and data is not None:
         raise ValueError("Startup placeholder cannot contain quota data")
     now = now or utcnow()
@@ -84,11 +98,12 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600, *, _refreshing=
             state = "暂无数据"
         else:
             sample_age = (now - timestamp(p["sampled_at"])).total_seconds()
+            stale = sample_age >= (stale_seconds or STALE_SECONDS[pid])
             if sample_age < -60:
                 state = "时钟异常"
             elif p["status"] == "error":
-                state = "采集失败 · 数据过期" if sample_age >= stale_seconds else "采集失败 · 上次数据"
-            elif sample_age >= stale_seconds:
+                state = "采集失败 · 数据过期" if stale else "采集失败 · 上次数据"
+            elif stale:
                 state = "数据过期"
             else:
                 state = "正常"
@@ -112,9 +127,9 @@ def frame(data, now=None, tz="Asia/Shanghai", stale_seconds=600, *, _refreshing=
         if windows and row_pitch < 110:
             raise ValueError("Provider/window count exceeds the PW3 single-frame layout")
         compact = len(windows) >= 3
-        for wi, w in enumerate(windows):
+        for wi, (w, name) in enumerate(zip(windows, labels(windows))):
             top = y + 168 + wi * row_pitch
-            text(left, top, label(w), 28 if compact else 32, True)
+            text(left, top, name, 28 if compact else 32, True)
             percent = w["remaining_percent"]
             # Round down: 0.4% must not promise 1% or suggest an exhausted 0%.
             display = "剩余不足1%" if 0 < percent < 1 else f"剩余 {int(percent)}%"

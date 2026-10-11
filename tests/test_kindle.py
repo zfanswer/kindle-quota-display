@@ -206,7 +206,8 @@ exit 1''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("unexpected", self.log.read_text())
         self.assertIn("rtc 180", self.log.read_text())
-        self.assertEqual((self.state / "uptime").read_text().split('.')[0], "130")
+        # 30s network budget, then the one-off 8s settle before the first suspend.
+        self.assertEqual((self.state / "uptime").read_text().split('.')[0], "138")
         self.assertIn("failures=1 next_delay=180", (self.base / "power.log").read_text())
 
     def start_visible_worker(self):
@@ -365,6 +366,50 @@ exec /bin/sleep .02''')
         self.assertNotIn("wirelessEnable", self.log.read_text())
         self.assertFalse((self.state / "frame.png").exists())
 
+    def test_install_hook_does_not_restart_or_redraw_after_explicit_stop(self):
+        self.placeholder()
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
+        power = self.state / "power"
+        power.touch()
+        rtc = self.state / "rtc/rtc0"
+        rtc.mkdir(parents=True)
+        (rtc / "wakealarm").write_text("0")
+        (rtc / "since_epoch").write_text("1700000000")
+        self.env.update(KQD_POWER_STATE=str(power), KQD_RTC_ROOT=str(rtc.parent))
+        script = self.base / "quota-dashboard.sh"
+        script.write_text(script.read_text().replace(
+            '    start)\n', '    start)\n        rm -f "$STATE/stop"; echo started > "$STATE/started"; exit 0\n'))
+        # Stopping with no worker still records the user's intent.
+        self.assertEqual(self.run_script("quota-dashboard.sh", "stop").returncode, 0)
+        result = self.run_script("bootstrap.sh", "--auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"Stopped by user", result.stdout)
+        self.assertFalse((self.state / "started").exists())
+        self.assertFalse(self.log.exists(), "the hook must not draw over the Library")
+        self.assertTrue((self.state / "stop").exists())
+        # A tap on the entry is explicit: it draws, starts, and clears the marker.
+        result = self.run_script("bootstrap.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state / "started").exists())
+        self.assertFalse((self.state / "stop").exists())
+        # Without a stop, the hook keeps its documented auto-start.
+        (self.state / "started").unlink()
+        self.assertEqual(self.run_script("bootstrap.sh", "--auto").returncode, 0)
+        self.assertTrue((self.state / "started").exists())
+
+    def test_stop_marker_survives_the_stopped_worker(self):
+        self.command("curl", 'exec /bin/sleep 30')
+        worker = self.start_visible_worker()
+        try:
+            self.run_script("quota-dashboard.sh", "stop")
+            worker.wait(timeout=4)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+        self.assertFalse((self.state / "lock").exists())
+        self.assertTrue((self.state / "stop").exists())
+        self.assertEqual((self.state / "status").read_text(), "stopped\n")
+
     def test_show_cache_preserves_running_process_state(self):
         (self.state / "frame.png").write_bytes(self.png.read_bytes())
         (self.state / "lock").mkdir()
@@ -491,6 +536,33 @@ now=$(cut -d. -f1 "$KQD_UPTIME"); printf '%s.00 0' "$((now + $1))" > "$KQD_UPTIM
         (self.state / "lock").mkdir()
         return self.run_script("quota-dashboard.sh", "run")
 
+    def test_backoff_steps_follow_a_longer_refresh_interval(self):
+        # INTERVAL=300: 5, 10, then the 15-minute ceiling; success returns to 300.
+        self.assertEqual(self.offline_waits(300, [300, 600, 900, 900, 900, 900, 300, 300], succeed_on=7),
+                         [300, 600, 900, 900, 900, 900, 300, 300])
+
+    def test_backoff_never_retries_sooner_than_the_refresh_interval(self):
+        self.assertEqual(self.offline_waits(1200, [1200, 1200, 1200]), [1200, 1200, 1200])
+
+    def test_short_refresh_interval_keeps_the_three_minute_backoff_step(self):
+        self.assertEqual(self.offline_waits(60, [180, 360, 540, 720, 900, 900]), [180, 360, 540, 720, 900, 900])
+
+    def offline_waits(self, interval, wakes, succeed_on=0):
+        self.virtual_device(wakes=",".join(map(str, wakes)), rounds=len(wakes))
+        config = self.base / "server.conf"
+        config.write_text(config.read_text().replace("INTERVAL=180", f"INTERVAL={interval}"))
+        original = (self.bin / "curl").read_text()
+        self.command("lipc-set-prop", '''printf 'lipc %s\\n' "$*" >> "$MOCK_LOG"
+case "$*" in *"wirelessEnable 1")
+ n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
+ printf '%s' "$((n+1))" > "$KQD_STATE/attempts";; esac''')
+        self.command("curl", f'''n=$(/bin/cat "$KQD_STATE/attempts")
+[ "$n" = {succeed_on} ] || exit 1
+''' + original.removeprefix("#!/bin/sh\n"))
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [int(line.split()[1]) for line in self.log.read_text().splitlines() if line.startswith("rtc ")]
+
     def test_offline_backoff_caps_and_success_resets(self):
         self.virtual_device(wakes=",".join(["180", "360", "540", "720", "900", "900", "180", "180"]), rounds=8)
         original = (self.bin / "curl").read_text()
@@ -510,28 +582,64 @@ case "$*" in *"wirelessEnable 1")
         self.assertIn("failures=0 next_delay=180", summaries)
         self.assertIn("failures=1 next_delay=180", summaries.split("failures=0 next_delay=180")[1])
 
-    def test_early_resume_rearms_remaining_with_wifi_off(self):
-        self.virtual_device(wakes="17,143", rounds=2)
+    def test_first_cycle_redraws_after_the_library_repaint(self):
+        # Tapping the entry makes the Library repaint over the first frame; the worker
+        # waits once and puts the committed frame back before sleeping. Later cycles do not.
+        self.virtual_device(wakes="180,180", rounds=2)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [call for call in self.log.read_text().splitlines() if call.startswith(("fbink ", "sleep ", "rtc "))]
+        first = calls.index("rtc 180")
+        self.assertEqual(calls[first - 2:first], ["sleep 8", f"fbink -q -i {self.state}/frame.png"])
+        self.assertEqual(sum(call.endswith("frame.next.png") for call in calls[:first]), 1)
+        self.assertFalse(any(call == "sleep 8" or call.endswith("/frame.png") for call in calls[first:]))
+
+    def test_first_cycle_without_a_frame_leaves_the_placeholder_not_the_library(self):
+        self.placeholder()
+        self.virtual_device(wakes="180", rounds=1)
+        self.command("curl", "exit 1")
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [call for call in self.log.read_text().splitlines() if call.startswith(("fbink ", "sleep 8", "rtc "))]
+        self.assertEqual(calls[-3:], ["sleep 8", f"fbink -q -i {self.base}/bootstrap-frame.png", "rtc 180"])
+
+    def test_early_wake_stops_the_loop_and_returns_the_device(self):
+        # Woken 17s into a 180s wait (power button): no second suspend, no redraw, no network.
+        self.virtual_device(wakes="17", rounds=99)
+        (self.state / "frame.png").write_bytes(self.png.read_bytes())
         result = self.worker()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
-        self.assertIn("rtc 180", calls)
-        self.assertIn("sleep 20", calls)
-        self.assertIn("rtc 143", calls)
-        early = calls.index("rtc 180")
-        again = calls.index("rtc 143")
-        self.assertFalse(any("wirelessEnable 1" in call for call in calls[early:again]))
-        self.assertEqual(sum(call.endswith("frame.next.png") for call in calls), 1)
-        self.assertFalse((self.state / "lock").exists())
-
-    def test_repeated_immediate_resume_exits_safely(self):
-        self.virtual_device(wakes="0,0,0", rounds=99)
-        result = self.worker()
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call for call in calls if call.startswith("rtc ")], ["rtc 180"])
+        after = calls[calls.index("rtc 180"):]
+        self.assertFalse(any(call.startswith(("fbink ", "sleep ")) for call in after))
+        self.assertEqual(sum("wirelessEnable 1" in call for call in calls), 2)  # round + restore only
+        # Both properties go back to what they were before the loop started (1 in this mock).
+        self.assertEqual(after[1:], ["lipc com.lab126.powerd preventScreenSaver 1", "lipc com.lab126.cmd wirelessEnable 1"])
         events = [json.loads(line) for line in (self.base / "lifecycle.log").read_text().splitlines()]
-        self.assertEqual(events[-1]["reason"], "suspend_failed")
+        self.assertEqual([(e["stage"], e["reason"]) for e in events[-2:]], [("resumed", "early_wake"), ("stopped", "early_wake")])
+        self.assertEqual(events[-1]["elapsed_seconds"], 17)
         self.assertFalse((self.state / "lock").exists())
-        self.assertEqual(sum("wirelessEnable 1" in call for call in self.log.read_text().splitlines()), 2)  # round + restore only
+        # The stop is remembered, so an install hook cannot restart the loop.
+        self.assertTrue((self.state / "stop").exists())
+        self.assertIn(b"Stopped by user", self.run_script("bootstrap.sh", "--auto").stdout)
+
+    def test_immediate_resume_also_stops_instead_of_spinning(self):
+        self.virtual_device(wakes="0", rounds=99)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in (self.base / "lifecycle.log").read_text().splitlines()]
+        self.assertEqual((events[-1]["stage"], events[-1]["reason"]), ("stopped", "early_wake"))
+        self.assertEqual(sum(call.startswith("rtc ") for call in self.log.read_text().splitlines()), 1)
+
+    def test_alarm_within_two_seconds_counts_as_on_time(self):
+        self.virtual_device(wakes="178,180", rounds=2)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual([call for call in calls if call.startswith("rtc ")], ["rtc 180", "rtc 180"])
+        events = [json.loads(line) for line in (self.base / "lifecycle.log").read_text().splitlines()]
+        self.assertNotIn("early_wake", [e["reason"] for e in events])
 
     def test_wall_clock_change_does_not_change_rtc_wait(self):
         self.virtual_device(wakes="180", rounds=1)
