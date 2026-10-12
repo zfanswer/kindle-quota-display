@@ -29,7 +29,7 @@ if [ "$FORCE" -eq 0 ] && [ -f "$BASE/server.cache" ]; then
     cached=$(cat "$BASE/server.cache")
 fi
 # Automatic calls never scan, even if ENABLE_SCAN=1. Deduplicate known hosts.
-for pass in 1 2 3; do
+for pass in 1 2 3 4 5; do
     seen=' '
     for known in "$cached" "$SERVER_IP" "$SERVER_HOST"; do
         valid_host "$known" || continue
@@ -37,9 +37,10 @@ for pass in 1 2 3; do
         seen="$seen$known "
         if probe "$known" "$WORK/health"; then found "$known"; fi
     done
-    # IPv4 can appear before association/routing is usable after RTC resume.
-    # These short retries share the original budget and never enable scanning.
-    [ "$FORCE" -eq 0 ] && [ "$pass" -lt 3 ] || break
+    # After an RTC resume with the radio left on, wlan0 can still show its old
+    # address while the link is re-established. These short retries share the
+    # original budget and never enable scanning.
+    [ "$FORCE" -eq 0 ] && [ "$pass" -lt 5 ] || break
     retry_time=$(budget_timeout 3) || break
     [ "$retry_time" -gt 1 ] || break
     bounded "$retry_time" sleep "$((retry_time - 1))" || break

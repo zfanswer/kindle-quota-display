@@ -165,16 +165,24 @@ valid_placeholder() {
     marker=$(dd if="$1" bs=1 skip=33 count=34 2>/dev/null | od -An -tx1 | tr -d ' \n')
     [ "$marker" = '0000001a744558746b71642d706c616365686f6c64657200726566726573682d7631' ]
 }
+wifi_state() {
+    bounded 3 lipc-get-prop com.lab126.cmd wirelessEnable > "$1" 2>/dev/null ||
+        bounded 3 lipc-get-prop com.lab126.wifid enable > "$1" 2>/dev/null || return 1
+}
 wifi_capture() {
-    bounded 3 lipc-get-prop com.lab126.cmd wirelessEnable > "$STATE/wifi-previous" 2>/dev/null ||
-        bounded 3 lipc-get-prop com.lab126.wifid enable > "$STATE/wifi-previous" 2>/dev/null || return 1
+    wifi_state "$STATE/wifi-previous" || return 1
     WIFI_PREVIOUS=$(cat "$STATE/wifi-previous")
     case "$WIFI_PREVIOUS" in 0|1) ;; *) return 1;; esac
 }
 wifi_begin() {
     [ -n "${WIFI_PREVIOUS:-}" ] || wifi_capture || return 1
-    timeout=$(budget_timeout 3) || return 1
-    bounded "$timeout" lipc-set-prop com.lab126.cmd wirelessEnable 1 >/dev/null 2>&1 || return 1
+    # The radio now stays enabled across RTC suspend. Switching it off right
+    # before suspending and on again after every resume twice left the module
+    # unable to scan until a reboot. Only switch it on when it is really off.
+    if ! wifi_state "$STATE/wifi-current" || [ "$(cat "$STATE/wifi-current")" != 1 ]; then
+        timeout=$(budget_timeout 3) || return 1
+        bounded "$timeout" lipc-set-prop com.lab126.cmd wirelessEnable 1 >/dev/null 2>&1 || return 1
+    fi
     while budget_timeout 1 >/dev/null; do
         timeout=$(budget_timeout 2) || return 1
         bounded "$timeout" ip -4 addr show dev wlan0 > "$STATE/wifi-address" 2>/dev/null || true
@@ -211,7 +219,9 @@ report() {
     fi
 }
 wifi_restore() {
-    case "${WIFI_PREVIOUS:-}" in 0|1) bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable "$WIFI_PREVIOUS" >/dev/null 2>&1 || true;; esac
+    # We only ever switch the radio on, so there is something to undo only
+    # when it was off before we started.
+    [ "${WIFI_PREVIOUS:-}" != 0 ] || bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable 0 >/dev/null 2>&1 || true
 }
 arm_rtc() {
     rtc_delay=${1:-$INTERVAL}

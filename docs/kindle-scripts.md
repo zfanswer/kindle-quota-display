@@ -14,7 +14,7 @@
 
 休眠期间按电源键、插USB或其他提前唤醒即停止循环：恢复启动时的Wi-Fi和屏保状态，不重画图片，也不再自动休眠，设备可以正常操作。屏幕上会暂留最后一张额度图，触摸后由系统界面重绘。要继续显示额度时点“开启Agent额度”；停止后安装钩子不会自行重启循环。
 
-省电循环每轮会主动关闭无线，再在 RTC 唤醒后开启，因此 Wi-Fi 会重新连接，系统界面也可能显示飞行模式。原因、代码路径、复现与证据边界见 [电源与无线行为](power-management.md)。
+省电循环休眠时不再关闭无线，唤醒后等待系统自行恢复连接；只有启动前无线是关闭的才会被打开，并在停止时关回。原因与证据边界见 [电源与无线行为](power-management.md)。
 
 ## 五个 Library 入口
 
@@ -87,7 +87,7 @@ bootstrap.sh / quota-dashboard.sh / find-server.sh → common.sh
 | `/mnt/us/eink-dashboard/bootstrap-frame.png` | 固定“正在刷新quota信息”占位图，不含额度/时间；只在无有效缓存时使用。有refresh-v1标记，旧版同名额度快照会被忽略 |
 | `/mnt/us/eink-dashboard/bootstrap.log` | 主入口/恢复入口的自检输出；主入口每次调用覆盖，恢复入口追加 |
 | `/mnt/us/eink-dashboard/run.log`、`run.previous.log` | 后台输出，每轮检查256KiB轮换 |
-| `/mnt/us/eink-dashboard/power.log`、`power.previous.log` | 每轮failures/next_delay/cycles摘要，256KiB轮换 |
+| `/mnt/us/eink-dashboard/power.log`、`power.previous.log` | 每轮failures/next_delay/cycles/net摘要（net为ok、no_server或no_ip），256KiB轮换 |
 | `/mnt/us/eink-dashboard/lifecycle.log`、`lifecycle.previous.log` | 固定启动/绘图/休眠/唤醒/退出事件，含系统epoch；服务器离线时也保留。当前文件达到256KiB后轮换，仅保留当前和上一份 |
 | `/mnt/us/eink-dashboard/discovery.log` | 手工重找的最后一次结果：成功为 `Rediscovered and refreshed`，失败为对应请求失败/超时或发现输出 |
 | `/tmp/kindle-quota-display/` | 临时PID/ready、固定ID request/result、生命周期锁、display-lock、停止标记、状态、最近成功frame.png和全屏刷新时间；停止保留图片，重启可能清除；不是USB用户存储目录 |

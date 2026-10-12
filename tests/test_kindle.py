@@ -172,7 +172,7 @@ exit 1''')
             result = self.run_script("find-server.sh", "--internal", *args)
             self.assertNotEqual(result.returncode, 0)
             urls = self.log.read_text().splitlines()
-            self.assertEqual(len(urls), 6)
+            self.assertEqual(len(urls), 10)  # two known hosts, five short passes
             self.assertTrue(all("192.168.1.9:8486/healthz" in url or "mac.example:8486/healthz" in url for url in urls))
 
     def test_outer_timeout_bounds_hung_curl_and_wget_dns(self):
@@ -208,7 +208,7 @@ exit 1''')
         self.assertIn("rtc 180", self.log.read_text())
         # 30s network budget, then the one-off 8s settle before the first suspend.
         self.assertEqual((self.state / "uptime").read_text().split('.')[0], "138")
-        self.assertIn("failures=1 next_delay=180", (self.base / "power.log").read_text())
+        self.assertIn("failures=1 next_delay=180 cycles=0 net=no_ip", (self.base / "power.log").read_text())
 
     def start_visible_worker(self):
         proc = self.state / "proc"
@@ -303,7 +303,7 @@ exec /bin/sleep .02''')
         self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
         calls = self.log.read_text()
         self.assertIn("fbink -q -f -i", calls)
-        self.assertEqual(calls.count("wirelessEnable 1"), 2)
+        self.assertNotIn("wirelessEnable", calls)  # already on: nothing to switch or restore
         self.assertFalse((self.state / "lock").exists())
         result = self.run_script("quota-dashboard.sh", "refresh")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -316,7 +316,7 @@ exec /bin/sleep .02''')
         result = self.run_script("quota-dashboard.sh", "refresh")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(old.read_bytes(), b"last good cache")
-        self.assertNotIn("fbink", self.log.read_text())
+        self.assertNotIn("fbink", self.log.read_text() if self.log.exists() else "")
 
     def test_decoder_failure_does_not_promote_frame(self):
         (self.state / "frame.png").write_bytes(b"last good cache")
@@ -552,10 +552,10 @@ now=$(cut -d. -f1 "$KQD_UPTIME"); printf '%s.00 0' "$((now + $1))" > "$KQD_UPTIM
         config = self.base / "server.conf"
         config.write_text(config.read_text().replace("INTERVAL=180", f"INTERVAL={interval}"))
         original = (self.bin / "curl").read_text()
-        self.command("lipc-set-prop", '''printf 'lipc %s\\n' "$*" >> "$MOCK_LOG"
-case "$*" in *"wirelessEnable 1")
- n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
- printf '%s' "$((n+1))" > "$KQD_STATE/attempts";; esac''')
+        self.command("ip", '''n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
+printf '%s' "$((n+1))" > "$KQD_STATE/attempts"
+printf '    inet 192.168.1.52/24 brd 192.168.1.255 scope global wlan0\\n'
+exit 0''')
         self.command("curl", f'''n=$(/bin/cat "$KQD_STATE/attempts")
 [ "$n" = {succeed_on} ] || exit 1
 ''' + original.removeprefix("#!/bin/sh\n"))
@@ -566,10 +566,10 @@ case "$*" in *"wirelessEnable 1")
     def test_offline_backoff_caps_and_success_resets(self):
         self.virtual_device(wakes=",".join(["180", "360", "540", "720", "900", "900", "180", "180"]), rounds=8)
         original = (self.bin / "curl").read_text()
-        self.command("lipc-set-prop", '''printf 'lipc %s\\n' "$*" >> "$MOCK_LOG"
-case "$*" in *"wirelessEnable 1")
- n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
- printf '%s' "$((n+1))" > "$KQD_STATE/attempts";; esac''')
+        self.command("ip", '''n=0; [ ! -f "$KQD_STATE/attempts" ] || n=$(/bin/cat "$KQD_STATE/attempts")
+printf '%s' "$((n+1))" > "$KQD_STATE/attempts"
+printf '    inet 192.168.1.52/24 brd 192.168.1.255 scope global wlan0\\n'
+exit 0''')
         self.command("curl", '''n=$(/bin/cat "$KQD_STATE/attempts")
 [ "$n" = 7 ] || exit 1
 ''' + original.removeprefix("#!/bin/sh\n"))
@@ -581,6 +581,32 @@ case "$*" in *"wirelessEnable 1")
         summaries = (self.base / "power.log").read_text()
         self.assertIn("failures=0 next_delay=180", summaries)
         self.assertIn("failures=1 next_delay=180", summaries.split("failures=0 next_delay=180")[1])
+
+    def test_radio_stays_enabled_across_suspend(self):
+        self.virtual_device(wakes="180,180", rounds=2)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(sum(call.startswith("rtc ") for call in calls), 2)
+        self.assertFalse(any("wirelessEnable" in call for call in calls))
+        self.assertIn("cycles=2 net=ok", (self.base / "power.log").read_text())
+
+    def test_radio_that_was_off_is_enabled_once_and_switched_off_on_stop(self):
+        self.command("lipc-get-prop", '''case "$*" in *wirelessEnable*)
+ if [ -f "$KQD_STATE/radio" ]; then printf '1\\n'; else printf '0\\n'; fi;; *) printf '1\\n';; esac''')
+        self.command("lipc-set-prop", '''printf "lipc %s\\n" "$*" >> "$MOCK_LOG"
+case "$*" in *"wirelessEnable 1") touch "$KQD_STATE/radio";; *"wirelessEnable 0") rm -f "$KQD_STATE/radio";; esac''')
+        self.virtual_device(wakes="180,180", rounds=2)
+        result = self.worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wireless = [call for call in self.log.read_text().splitlines() if "wirelessEnable" in call]
+        self.assertEqual(wireless, ["lipc com.lab126.cmd wirelessEnable 1", "lipc com.lab126.cmd wirelessEnable 0"])
+
+    def test_power_log_names_why_a_round_failed(self):
+        self.virtual_device(wakes="180", rounds=1)
+        self.command("curl", "exit 1")
+        self.assertEqual(self.worker().returncode, 0)
+        self.assertIn("failures=1 next_delay=180 cycles=0 net=no_server", (self.base / "power.log").read_text())
 
     def test_first_cycle_redraws_after_the_library_repaint(self):
         # Tapping the entry makes the Library repaint over the first frame; the worker
@@ -613,9 +639,9 @@ case "$*" in *"wirelessEnable 1")
         self.assertEqual([call for call in calls if call.startswith("rtc ")], ["rtc 180"])
         after = calls[calls.index("rtc 180"):]
         self.assertFalse(any(call.startswith(("fbink ", "sleep ")) for call in after))
-        self.assertEqual(sum("wirelessEnable 1" in call for call in calls), 2)  # round + restore only
-        # Both properties go back to what they were before the loop started (1 in this mock).
-        self.assertEqual(after[1:], ["lipc com.lab126.powerd preventScreenSaver 1", "lipc com.lab126.cmd wirelessEnable 1"])
+        # The radio was on before the loop and is never touched; the screensaver setting goes back.
+        self.assertFalse(any("wirelessEnable" in call for call in calls))
+        self.assertEqual(after[1:], ["lipc com.lab126.powerd preventScreenSaver 1"])
         events = [json.loads(line) for line in (self.base / "lifecycle.log").read_text().splitlines()]
         self.assertEqual([(e["stage"], e["reason"]) for e in events[-2:]], [("resumed", "early_wake"), ("stopped", "early_wake")])
         self.assertEqual(events[-1]["elapsed_seconds"], 17)

@@ -86,17 +86,23 @@ round() {
     mode=--known-only; seconds=30; REQUEST_ID=
     if pending_request; then mode=--force; seconds=120; fi
     network_begin "$seconds"
-    if wifi_begin && refresh "$mode"; then
+    # net tells a later reader why a round failed: no address at all, an
+    # address but no server/frame, or the server was reached.
+    round_result=failed; round_net=no_ip
+    if wifi_begin; then
+        round_net=no_server
+        if refresh "$mode"; then round_result=success; fi
+        [ "$NETWORK_OK" -eq 0 ] || round_net=ok
+    fi
+    if [ "$round_result" = success ]; then
         CYCLES=$((CYCLES + 1)); next_delay success
         printf 'frame_ok\n' > "$STATE/status"; report frame_ok
-        round_result=success
         if [ "$CYCLES" -ge 2 ]; then rm -f "$BASE/../documents/Recover Agent Quota.sh"; fi
     else
         next_delay failure
         printf 'refresh_failed\n' > "$STATE/status"; report refresh_failed
-        round_result=failed
     fi
-    bounded_log "$BASE/power.log" "round failures=$FAILURES next_delay=$NEXT_DELAY cycles=$CYCLES"
+    bounded_log "$BASE/power.log" "round failures=$FAILURES next_delay=$NEXT_DELAY cycles=$CYCLES net=$round_net"
     if [ -f "$BASE/run.log" ] && [ "$(wc -c < "$BASE/run.log")" -ge 262144 ]; then
         mv "$BASE/run.log" "$BASE/run.previous.log"
         exec >> "$BASE/run.log" 2>&1
@@ -119,7 +125,7 @@ rtc_wait() {
     deadline=$ALARM
     suspend_started=$(rtc_now) || { STOP_REASON=rtc_unavailable; return 1; }
     report suspend_armed
-    bounded 3 lipc-set-prop com.lab126.cmd wirelessEnable 0 || return 1
+    # Wireless is deliberately left enabled through the suspend; see wifi_begin.
     NETWORK_OK=0
     bounded 10 sync || { STOP_REASON=suspend_failed; return 1; }
     printf 'mem\n' > "$POWER" || { STOP_REASON=suspend_failed; return 1; }
@@ -155,7 +161,7 @@ cleanup() {
     printf 'stopped\n' > "$STATE/status"
     # The stop marker outlives the worker: it keeps install hooks from
     # restarting the loop and is cleared only by an explicit start.
-    rm -f "$STATE/pid" "$STATE/ready" "$STATE/frame.next.png" "$STATE/server.next" "$STATE/wifi-address"
+    rm -f "$STATE/pid" "$STATE/ready" "$STATE/frame.next.png" "$STATE/server.next" "$STATE/wifi-address" "$STATE/wifi-current"
     rmdir "$STATE/lock" 2>/dev/null || true
 }
 owned_pid() {
