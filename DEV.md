@@ -85,6 +85,7 @@ python scripts/render-previews.py
 - Scriptlets 需要支持 hooks；主入口文件只有函数定义，普通 `sh entry.sh` 不会自动调用 `on_run`。
 - 主入口自检通过后将 `ALLOW_SUSPEND=0` 改为 1。ALLOW_SUSPEND=0 仍只是不休眠的诊断模式。
 - 省电模式每轮RTC休眠，无线保持开启、不再每轮开关：关无线后立即挂起、唤醒后立即再开的时序曾两次让无线模块扫描不到任何热点，重启才恢复。唤醒后wlan0可能还带着旧地址而链路未恢复，所以已知地址短重试为5次。默认正常3分钟，连续失败每次加一个INTERVAL（至少3分钟）至15分钟，且不短于INTERVAL。下一轮有30秒共享网络预算和IPv4就绪判断/已知地址短重试，不自动扫描子网。
+- 进入USB模式时系统会直接杀掉占用用户存储的进程，worker可能来不及清理而留下锁。锁目录里的owner记录持有者PID，持有者已不是本项目进程时由下一次获取锁的动作回收；改动锁逻辑时保持“活动持有者不可抢占”。
 - 其他进程占用 wakealarm 时不能覆盖；RTC 设备/epoch 支持按实际驱动核验。
 - 早于RTC截止时间2秒以上返回（电源键、USB或其他唤醒源，含立即返回）视为用户取回设备：记录resumed/early_wake后以stopped/early_wake退出，恢复原无线/屏保，不重画、不再挂起。曾经的“20秒交互后重新挂起”会让设备在用户操作中途失去响应，已移除。停止标记在worker退出后保留，安装钩子（--auto）见到标记不重画也不启动，只有显式start清除。
 - 固定事件同时写入设备lifecycle.log，达到256KiB时轮换为lifecycle.previous.log；日志在服务器不可达时也保留，不含原始CLI/HTTP数据。
@@ -92,7 +93,7 @@ python scripts/render-previews.py
 - 启动先显示最近成功frame.png，无有效缓存则显示固定“正在刷新quota信息”，再联网；已有worker也可恢复画面。首轮之后worker会等8秒再show-cache一次，因为入口返回时Library的重绘会盖住首帧。show-cache不改Wi-Fi/RTC/进程状态，占位不提交为真实缓存；/tmp不保证跨重启。
 - 固定资产在kindle/assets/bootstrap-frame.png，部署到同名设备路径；refresh-v1标记使旧版额度快照被忽略。可用`python -m quota_display.render --placeholder --output kindle/assets/bootstrap-frame.png`重建，不接受quota输入或时间参数。
 - 绘图与成功缓存提交由同一display-lock保护，预览不能在新图绘制与提交之间重绘旧图；生命周期锁与绘图锁各司其职。
-- 自动只探测缓存/IP/主机名；手动扫描限制实际私有 `/22` 至 `/30`；SERVER_ID 是身份标记而非认证。活动worker的rediscover请求有ID/ready握手，不能用信号单独唤醒mem。
+- 自动只并行探测已知地址（server.cache 里历次成功的地址、配置的一个或多个 SERVER_IP、主机名，最多 12 个）；手动扫描限制实际私有 `/22` 至 `/30`，顺序为本机 /24、已知地址所在 /24、其余；“重找”入口不带 DontUseFBInk，由 Scriptlet 把输出画到屏幕，所以画完图片后不能再打印任何内容，提示用 ASCII（FBInk 内置字体无中文）；SERVER_ID 是身份标记而非认证。活动worker的rediscover请求有ID/ready握手，不能用信号单独唤醒mem。
 
 ## 二开方向与验证要求
 

@@ -14,13 +14,13 @@
 | HTTP | 8486 | Compose默认127.0.0.1发布，容器内0.0.0.0监听 |
 | Kindle成功后间隔 | 180秒 | INTERVAL配置60..3600，实际帧间隔含工作开销 |
 | 失败后RTC等待 | 默认180、360、540、720、900秒 | 每个失败轮次增加一个步长（INTERVAL，至少180秒），上限900秒且不短于INTERVAL；成功清零 |
-| 网络工作预算 | 自动30秒，手动120秒 | 无线就绪、已知地址、PNG、在线遥测共享预算；收尾/FBInk另有短超时 |
+| 网络工作预算 | 自动30秒，手动180秒 | 无线就绪、已知地址、PNG、在线遥测共享预算；收尾/FBInk另有短超时 |
 | 全屏刷新 | 1800秒 | 配置60..86400，不小于INTERVAL |
 | 数据过期 | sampled_at年龄≥900秒（Codex）或2700秒（Claude） | 按Provider判断，为默认采集间隔的3倍 |
 | 时区 | Asia/Shanghai | 数据UTC、UI按配置时区转换 |
 | PNG | 1072×1448、L8、16灰阶 | 无alpha，客户端上限256KiB |
-| 自动发现 | 缓存、配置IP、主机名 | 每次候选去重，最多5次短探测；永不扫描子网 |
-| 手动扫描 | 实际私有IPv4 /22.. /30 | 最多1022主机、16并发、90秒扫描预算，且受120秒网络总预算限制 |
+| 自动发现 | 已知地址列表 | server.cache中历次成功的地址（最近的在前，最多8个）、配置的一个或多个SERVER_IP（逗号分隔，最多8个）、主机名；去重后最多12个并行探测，最多5次短探测；永不扫描子网 |
+| 手动扫描 | 实际私有IPv4 /22.. /30 | 最多1022主机、32并发、150秒扫描预算，且受180秒网络总预算限制；先扫本机所在/24，再扫已知地址所在/24，最后其余 |
 | 休眠 | 配置模板0 | 主入口自检成功改为1，再启动RTC循环 |
 
 ## 数据契约
@@ -60,17 +60,17 @@ stage为bootstrap、preflight_failed、frame_ok、refresh_failed、suspend_armed
 ## Kindle行为
 
 - 配置逐项解析为数据，不source/eval配置；未知/重复key拒绝。不增加退避配置或作息时段。
-- 自动worker、普通refresh以及find-server默认只探测缓存、配置IP、主机名；候选去重，最多5次短探测，重试间隔最多2秒且共享总预算。始终核验healthz协议和SERVER_ID。
+- 自动worker、普通refresh以及find-server默认只探测已知地址列表：server.cache里历次成功的地址、配置的SERVER_IP（可为逗号分隔的多个）和主机名。候选去重后一起并行探测，列表变长不延长清醒时间；最多5次短探测，重试间隔最多2秒且共享总预算。始终核验healthz协议和SERVER_ID。找到的地址移到server.cache首位，其余保留，最多8个。
 - 仅显式手动rediscover / find-server --force允许扫描，且需ENABLE_SCAN=1；--known-only与--force互斥。手动扫描不扩大实际CIDR，不扫描公网或/21及更大网段。网络变化、DHCP换IP且主机名失效时由用户手动重找。
 - 连续失败按完整刷新轮次计数，上限5。下一等待为min(failures,5)×步长，步长为INTERVAL且不小于180秒，结果不超过900秒也不短于INTERVAL：默认INTERVAL=180时为180至900秒，INTERVAL=300时为300、600、900秒，INTERVAL超过900秒时始终等于INTERVAL。只有有效PNG成功解码、绘图并原子提交后清零，成功等待INTERVAL。有效“暂无数据”PNG算成功；多个候选失败后成功仍算成功。停止/取消不算失败；重新开启或重启清零。
 - 单实例锁保护run/refresh/单次rediscover，独立display-lock保护绘图和缓存提交。坏图、下载或解码失败不清屏、不覆盖成功frame.png。常规失败不反复重画旧图。
 - 启动先show-cache显示最近成功frame.png；缓存缺失、无效或解码失败时使用固定卡片式bootstrap-frame.png，提示“正在刷新quota信息”。必须有refresh-v1标记；旧版同名额度快照被忽略。占位不提交为frame.png，/tmp缓存不保证跨重启。show-cache不联网、不动RTC/任务状态，绘图繁忙时跳过。入口返回后Library会自行重绘并可能盖住首帧，所以worker在首轮之后等待8秒再用show-cache重画一次，然后才进入等待；之后各轮不重复。
 - bootstrap把设备能力与服务器在线状态分开：检查FBInk可执行、无线/屏保状态可读、可写power、空闲RTC及可读硬件时间。通过后启用RTC并start；Mac离线也能进入失败退避。已有ready worker时只恢复画面，不重复启动。
-- 每轮network_begin建立基于/proc/uptime的30秒预算；手动为120秒。无线仅在关闭时才被打开（停止时只在启动前为关闭的情况下关回），随后有界等待有效IPv4；IPv4并不代表服务器可达。每个HTTP请求同时受剩余预算和外层watchdog限制，包括wget解析卡住的情况。FBInk最多10秒、设备属性命令最多3秒，超时终止有1秒强制回收宽限；网络预算不是整机清醒时间硬上限。
+- 每轮network_begin建立基于/proc/uptime的30秒预算；手动为180秒。无线仅在关闭时才被打开（停止时只在启动前为关闭的情况下关回），随后有界等待有效IPv4；IPv4并不代表服务器可达。每个HTTP请求同时受剩余预算和外层watchdog限制，包括wget解析卡住的情况。FBInk最多10秒、设备属性命令最多3秒，超时终止有1秒强制回收宽限；网络预算不是整机清醒时间硬上限。
 - RTC arm_rtc(delay)只选择空闲可写rtc0/rtc1，相对alarm不支持时使用硬件epoch。等待期间mem休眠，无线保持开启、不在每轮开关；ALLOW_SUSPEND=0仅为明确的诊断模式，使用普通等待。线上成功后的INTERVAL不被退避改写。
 - 等待使用同一个RTC的since_epoch和实际alarm截止时间，不比较RTC与系统epoch。返回后先检查停止/手动请求；比截止时间早2秒以上（含立即返回）视为用户取回设备：记录resumed/early_wake，写入停止标记，以stopped/early_wake正常退出并恢复原无线/屏保，不重画缓存、不再挂起，也不增加失败计数。差2秒以内按到期处理。系统墙钟调整不延长等待。
 - 明确挂起失败或硬件计时异常时，以suspend_failed退出并归还原生电源管理，可能恢复Kindle原生待机页。早醒退出后需手动点“开启Agent额度”才会继续。
-- 活动worker安装USR1/停止处理后发布pid和ready。手动入口原子发布固定请求ID并只通知经cmdline/ready核验的worker；由worker跳过退避、单独扫描/刷新。重复待办合并，结果按请求ID匹配；没有worker时只做一轮，不启动循环。信号本身不能唤醒mem，Library操作须先让设备醒来。停止优先，不移除活动/遗留锁。停止标记在worker退出后保留，只由显式start清除；安装钩子以--auto调用bootstrap，存在停止标记时不重画、不启动。
+- 活动worker安装USR1/停止处理后发布pid和ready。手动入口原子发布固定请求ID并只通知经cmdline/ready核验的worker；由worker跳过退避、单独扫描/刷新。重复待办合并，结果按请求ID匹配；没有worker时rediscover自己做一轮并打印原因；“重找”入口在其成功后调用bootstrap恢复循环，失败不启动。该入口不带DontUseFBInk，输出由Scriptlet显示在屏幕并写入discovery.log；画出图片之后不再打印任何内容。信号本身不能唤醒mem，Library操作须先让设备醒来。停止优先，不移除活动锁。锁内记录持有者PID；持有者已不存在或已不是本项目进程时（进入USB模式会杀掉使用用户存储的进程，来不及清理），下一次start/refresh/rediscover在短暂等待后回收该锁，不再需要重启。stop对持有锁的任何本项目进程生效（循环、单次刷新或查找），没有活动进程时清掉遗留的锁、PID和ready。停止标记在worker退出后保留，只由显式start清除；安装钩子以--auto调用bootstrap，存在停止标记时不重画、不启动。
 - cleanup终止并回收拥有的命令、探测子进程和短等待，只有wakealarm仍匹配自己的alarm时才清除，恢复原无线/屏保，清理PID/ready/锁。停止不为遥测重新开启无线。
 - lifecycle.log保存原固定遥测事件；power.log每轮只记失败数/下一间隔/成功轮数及net（ok、no_server、no_ip），各达到256KiB时轮换并仅保留当前/上一份。已知不可达、休眠及停止时只记本地，不HTTP POST；连接成功且预算有余时上报，不补发旧事件、不扩展HTTP Schema。run.log的输出也在每轮达到256KiB时轮换。
 - 临时恢复入口成功绘图两次后删除；设备增量更新不重新添加它，保留个人server.conf/server.cache。

@@ -9,7 +9,7 @@ done
 [ "$FORCE:$KNOWN_ONLY" != 1:1 ] || exit 2
 mkdir -p "$STATE"
 WORK=$(mktemp -d /tmp/kqd-discover.XXXXXX)
-pids=''
+pids=''; FOUND=; checked=0
 cleanup() {
     cancel_command
     for scan_pid in $pids; do kill "$scan_pid" 2>/dev/null || true; done
@@ -19,24 +19,64 @@ cleanup() {
 }
 trap cleanup 0
 trap 'exit 1' 1 2 15
+# Progress goes to stderr and only for a manual search: the launcher shows it
+# on screen. Automatic rounds stay silent. stdout carries the address alone.
+note() { [ "$FORCE" -eq 0 ] || printf '%s\n' "$1" >&2; }
 if [ -z "${KQD_NET_DEADLINE:-}" ]; then
-    if [ "$FORCE" -eq 1 ]; then network_begin 120; else network_begin 30; fi
+    if [ "$FORCE" -eq 1 ]; then network_begin 180; else network_begin 30; fi
 fi
 [ "$INTERNAL" -eq 1 ] || wifi_begin
-found() { save_server "$1"; printf '%s\n' "$1"; exit 0; }
-cached=
-if [ "$FORCE" -eq 0 ] && [ -f "$BASE/server.cache" ]; then
-    cached=$(cat "$BASE/server.cache")
-fi
-# Automatic calls never scan, even if ENABLE_SCAN=1. Deduplicate known hosts.
-for pass in 1 2 3 4 5; do
-    seen=' '
-    for known in "$cached" "$SERVER_IP" "$SERVER_HOST"; do
-        valid_host "$known" || continue
-        case "$seen" in *" $known "*) continue;; esac
-        seen="$seen$known "
-        if probe "$known" "$WORK/health"; then found "$known"; fi
+found() { save_server "$1"; note "Found the quota server at $1 (saved)."; printf '%s\n' "$1"; exit 0; }
+collect() {
+    for pid in $pids; do wait "$pid" || true; done
+    pids=''
+    for file in "$WORK"/found.*; do
+        [ ! -f "$file" ] || { FOUND=$(cat "$file"); return 0; }
     done
+    rm -f "$WORK"/probe.*
+    return 1
+}
+# Probe every address in file $1, at most $2 at once ($3 = how many there are).
+# Sets FOUND and returns 0 for the first batch with an answer; returns 1 when
+# none answered or the shared network budget ran out (then OUT_OF_TIME=1).
+probe_all() {
+    batch=0; OUT_OF_TIME=0
+    while IFS= read -r candidate; do
+        if ! budget_timeout 1 >/dev/null; then OUT_OF_TIME=1; break; fi
+        checked=$((checked + 1)); batch=$((batch + 1))
+        (
+            CHILD_PID= TIMER_PID=
+            trap cancel_command 0
+            trap 'exit 1' 1 2 15
+            if probe "$candidate" "$WORK/probe.$checked"; then printf '%s\n' "$candidate" > "$WORK/found.$checked"; fi
+        ) &
+        pids="$pids $!"
+        [ "$batch" -ge "$2" ] || continue
+        collect && return 0
+        batch=0
+        [ "$((checked % 128))" -ne 0 ] || note "  checked $checked of $3"
+    done < "$1"
+    collect
+}
+# Known addresses: every server found before (most recent first), then the
+# configured addresses and host name. They are probed together, so a longer
+# list does not keep the device awake longer.
+: > "$WORK/known"
+remember() {
+    valid_host "$1" || return 0
+    [ "$(wc -l < "$WORK/known")" -lt 12 ] || return 0
+    grep -qxF -e "$1" "$WORK/known" || printf '%s\n' "$1" >> "$WORK/known"
+}
+if [ -f "$BASE/server.cache" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do remember "$line"; done < "$BASE/server.cache"
+fi
+for known in $(printf '%s' "$SERVER_IP" | tr ',' ' '); do remember "$known"; done
+remember "$SERVER_HOST"
+known_count=$(wc -l < "$WORK/known" | tr -d ' ')
+note "Trying $known_count known address(es)..."
+for pass in 1 2 3 4 5; do
+    checked=0
+    if probe_all "$WORK/known" 12 "$known_count"; then found "$FOUND"; fi
     # After an RTC resume with the radio left on, wlan0 can still show its old
     # address while the link is re-established. These short retries share the
     # original budget and never enable scanning.
@@ -46,55 +86,47 @@ for pass in 1 2 3 4 5; do
     bounded "$retry_time" sleep "$((retry_time - 1))" || break
 done
 [ "$FORCE" -eq 1 ] || exit 1
-[ "$ENABLE_SCAN" -eq 1 ] || exit 1
-# Scan the actual private subnet, capped at /22 (1022 hosts). Prioritize the
-# local /24 intersection, then the rest; never guess or broaden the mask.
+note 'None of them answered.'
+[ "$ENABLE_SCAN" -eq 1 ] || { note 'Scanning is disabled (ENABLE_SCAN=0); set SERVER_IP.'; exit 1; }
+# Scan the actual private subnet, capped at /22 (1022 hosts); never guess or
+# broaden the mask.
 cidr=$(ip -4 addr show dev wlan0 2>/dev/null | awk '$1=="inet" {print $2; exit}')
 mask=${cidr##*/}
-case "$mask" in 22|23|24|25|26|27|28|29|30) ;; *) echo 'Manual scan requires private IPv4 /22 through /30; configure SERVER_IP' >&2; exit 1;; esac
+case "$mask" in 22|23|24|25|26|27|28|29|30) ;; *) echo "Manual scan requires private IPv4 /22 through /30 (this network: ${cidr:-none}); configure SERVER_IP" >&2; exit 1;; esac
 local_ip=${cidr%/*}
 valid_ip "$local_ip" || exit 1
 case "$local_ip" in
     10.*|192.168.*) ;;
-    172.*) second=$(printf '%s' "$local_ip" | cut -d. -f2); [ "$second" -ge 16 ] && [ "$second" -le 31 ] || exit 1;;
-    *) exit 1;;
+    172.*) second=$(printf '%s' "$local_ip" | cut -d. -f2); [ "$second" -ge 16 ] && [ "$second" -le 31 ] || { echo 'Manual scan requires a private network; configure SERVER_IP' >&2; exit 1; };;
+    *) echo 'Manual scan requires a private network; configure SERVER_IP' >&2; exit 1;;
 esac
+# Order: this device's /24, then the /24 of every known address inside this
+# subnet (a server usually stays in its neighbourhood), then the rest.
 # AWK numbers represent IPv4 exactly, avoiding signed 32-bit shell overflow.
 awk -v addr="$local_ip" -v mask="$mask" '
+function number(text, o) { split(text,o,"."); return o[1]*16777216+o[2]*65536+o[3]*256+o[4] }
 function dotted(n, a,b,c,d) {
     a=int(n/16777216); b=int(n/65536)%256; c=int(n/256)%256; d=n%256
     return sprintf("%d.%d.%d.%d",a,b,c,d)
 }
-BEGIN {
-    split(addr,o,"."); me=o[1]*16777216+o[2]*65536+o[3]*256+o[4]
+function rank(n) { return int(n/256)==int(me/256) ? 0 : (int(n/256) in near ? 1 : 2) }
+/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { near[int(number($0)/256)]=1 }
+END {
+    me=number(addr)
     size=2^(32-mask); first=int(me/size)*size+1; last=first+size-3
-    nearby=int(me/256)*256
-    for(pass=0;pass<2;pass++) for(n=first;n<=last;n++)
-        if(n!=me && ((n>=nearby && n<nearby+256) == (pass==0))) print dotted(n)
-}' > "$WORK/candidates"
-scan_deadline=$(($(tick) + 90))
+    for(pass=0;pass<3;pass++) for(n=first;n<=last;n++)
+        if(n!=me && rank(n)==pass) print dotted(n)
+}' "$WORK/known" > "$WORK/candidates"
+total=$(wc -l < "$WORK/candidates" | tr -d ' ')
+scan_deadline=$(($(tick) + 150))
 [ "$scan_deadline" -le "$KQD_NET_DEADLINE" ] || scan_deadline=$KQD_NET_DEADLINE
 KQD_NET_DEADLINE=$scan_deadline; export KQD_NET_DEADLINE
-n=0; batch=0
-while IFS= read -r candidate; do
-    if ! budget_timeout 1 >/dev/null; then
-        echo 'Quota server scan time budget exhausted' >&2
-        exit 1
-    fi
-    n=$((n + 1)); batch=$((batch + 1))
-    (
-        CHILD_PID= TIMER_PID=
-        trap cancel_command 0
-        trap 'exit 1' 1 2 15
-        if probe "$candidate" "$WORK/probe.$n"; then printf '%s\n' "$candidate" > "$WORK/found.$n"; fi
-    ) &
-    pids="$pids $!"
-    if [ "$batch" -lt 16 ]; then continue; fi
-    for pid in $pids; do wait "$pid" || true; done
-    for file in "$WORK"/found.*; do [ ! -f "$file" ] || found "$(cat "$file")"; done
-    batch=0; pids=''
-done < "$WORK/candidates"
-for pid in $pids; do wait "$pid" || true; done
-for file in "$WORK"/found.*; do [ ! -f "$file" ] || found "$(cat "$file")"; done
-echo 'Quota server not found' >&2
+note "Scanning $total addresses on $cidr (up to $((scan_deadline - $(tick)))s)..."
+checked=0
+if probe_all "$WORK/candidates" 32 "$total"; then found "$FOUND"; fi
+if [ "$OUT_OF_TIME" -eq 1 ]; then
+    echo "Quota server scan time budget exhausted after $checked of $total addresses" >&2
+else
+    echo "Quota server not found: none of $total addresses answered" >&2
+fi
 exit 1

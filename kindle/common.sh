@@ -115,7 +115,17 @@ load_conf() {
         case "$seen" in *" $key "*) echo 'Duplicate config key' >&2; return 1;; esac
         seen="$seen$key "
         case "$key" in
-            SERVER_IP) [ -z "$value" ] || valid_ip "$value" || return 1; SERVER_IP=$value;;
+            SERVER_IP)
+                # One address, or up to eight separated by commas (one per usual network).
+                case "$value" in *[!0-9.,]*|,*|*,|*,,*) return 1;; esac
+                [ "${#value}" -le 127 ] || return 1
+                conf_count=0
+                for conf_ip in $(printf '%s' "$value" | tr ',' ' '); do
+                    valid_ip "$conf_ip" || return 1
+                    conf_count=$((conf_count + 1))
+                done
+                [ "$conf_count" -le 8 ] || return 1
+                SERVER_IP=$value;;
             SERVER_HOST) [ -z "$value" ] || valid_host "$value" || return 1; SERVER_HOST=$value;;
             PORT) valid_uint "$value" 1 65535 || return 1; PORT=$value;;
             SERVER_ID) case "$value" in ''|*[!A-Za-z0-9_-]*) return 1;; esac; [ "${#value}" -le 48 ] || return 1; SERVER_ID=$value;;
@@ -146,9 +156,17 @@ probe() {
     [ "$(cat "$target")" = "$expected" ]
 }
 save_server() {
-    # Separate mutable cache from reviewed server.conf.
-    if [ -f "$BASE/server.cache" ] && [ "$(cat "$BASE/server.cache")" = "$1" ]; then return 0; fi
-    printf '%s\n' "$1" > "$BASE/.server-cache.$$" && mv "$BASE/.server-cache.$$" "$BASE/server.cache"
+    # Separate mutable cache from reviewed server.conf. It lists every address
+    # that has answered, most recent first, so each usual network is remembered.
+    if [ -f "$BASE/server.cache" ] && IFS= read -r cache_first < "$BASE/server.cache" && [ "$cache_first" = "$1" ]; then return 0; fi
+    {
+        printf '%s\n' "$1"
+        if [ -f "$BASE/server.cache" ]; then
+            while IFS= read -r cache_line || [ -n "$cache_line" ]; do
+                [ "$cache_line" = "$1" ] || ! valid_host "$cache_line" || printf '%s\n' "$cache_line"
+            done < "$BASE/server.cache"
+        fi
+    } | head -n 8 > "$BASE/.server-cache.$$" && mv "$BASE/.server-cache.$$" "$BASE/server.cache"
 }
 valid_png() {
     [ -f "$1" ] || return 1
@@ -194,8 +212,8 @@ wifi_begin() {
 }
 report() {
     # Fixed enums only. This telemetry cannot execute host commands or alter quota.
-    report_host=$SERVER_IP
-    [ ! -f "$BASE/server.cache" ] || report_host=$(cat "$BASE/server.cache")
+    # Only the server that answered in this round receives telemetry.
+    report_host=${SERVER_FOUND:-}
     report_rtc=${RTC:-/sys/class/rtc/rtc0/wakealarm}
     rtc_device=0; case "$report_rtc" in */rtc1/wakealarm) rtc_device=1;; esac
     rtc_epoch=$(cat "${report_rtc%/wakealarm}/since_epoch" 2>/dev/null) || rtc_epoch=0

@@ -60,11 +60,11 @@ next_delay() {
 }
 refresh() {
     discovery_mode=${1:---known-only}
-    timeout=$(budget_timeout 95) || return 1
+    timeout=$(budget_timeout 170) || return 1
     bounded "$timeout" "$BASE/find-server.sh" --internal "$discovery_mode" > "$STATE/server.next" || return 1
     server=$(cat "$STATE/server.next")
     valid_host "$server" || return 1
-    NETWORK_OK=1
+    NETWORK_OK=1; SERVER_FOUND=$server
     next=$STATE/frame.next.png
     fetch "http://$server:$PORT/frame/kindle1.png" "$next" 15 || { NETWORK_OK=0; rm -f "$next"; return 1; }
     valid_png "$next" || { rm -f "$next"; return 1; }
@@ -84,7 +84,7 @@ refresh() {
 }
 round() {
     mode=--known-only; seconds=30; REQUEST_ID=
-    if pending_request; then mode=--force; seconds=120; fi
+    if pending_request; then mode=--force; seconds=180; fi
     network_begin "$seconds"
     # net tells a later reader why a round failed: no address at all, an
     # address but no server/frame, or the server was reached.
@@ -162,7 +162,31 @@ cleanup() {
     # The stop marker outlives the worker: it keeps install hooks from
     # restarting the loop and is cleared only by an explicit start.
     rm -f "$STATE/pid" "$STATE/ready" "$STATE/frame.next.png" "$STATE/server.next" "$STATE/wifi-address" "$STATE/wifi-current"
+    rm -f "$STATE/lock/owner"
     rmdir "$STATE/lock" 2>/dev/null || true
+}
+# The lock records who holds it. Entering USB drive mode kills every process
+# that uses the user store, so a holder can die without running cleanup; a lock
+# whose owner is no longer one of our processes is reclaimed instead of
+# blocking every later start until a reboot.
+lock_holder_alive() {
+    [ -f "$STATE/lock/owner" ] || return 1
+    holder=$(cat "$STATE/lock/owner" 2>/dev/null) || return 1
+    case "$holder" in ''|*[!0-9]*) return 1;; esac
+    [ -r "${KQD_PROC_ROOT:-/proc}/$holder/cmdline" ] || return 1
+    case "$(tr '\000' ' ' < "${KQD_PROC_ROOT:-/proc}/$holder/cmdline")" in *"$BASE/quota-dashboard.sh "*) return 0;; esac
+    return 1
+}
+acquire_lock() {
+    if mkdir "$STATE/lock" 2>/dev/null; then printf '%s\n' "$$" > "$STATE/lock/owner"; return 0; fi
+    lock_holder_alive && return 1
+    # A starter that has just created the lock gets time to register itself.
+    sleep 2
+    lock_holder_alive && return 1
+    rm -f "$STATE/lock/owner"
+    rmdir "$STATE/lock" 2>/dev/null || return 1
+    mkdir "$STATE/lock" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$STATE/lock/owner"
 }
 owned_pid() {
     [ -f "$STATE/pid" ] || return 1
@@ -192,9 +216,9 @@ case "$ACTION" in
         ;;
     start)
         [ -x "$FBINK" ] || { echo 'FBInk missing' >&2; exit 1; }
-        if ! mkdir "$STATE/lock" 2>/dev/null; then
+        if ! acquire_lock; then
             owned_pid && exit 0
-            echo 'Lock exists; check active refresh/run before removing stale lock' >&2; exit 1
+            echo 'Another dashboard task is still running; try again in a moment.' >&2; exit 1
         fi
         rm -f "$STATE/stop" "$STATE/request" "$STATE/result" "$STATE/ready"
         if command -v setsid >/dev/null 2>&1; then
@@ -210,6 +234,8 @@ case "$ACTION" in
         trap 'STOP_REASON=signal_int; exit 0' 2
         trap 'STOP_REASON=signal_term; exit 0' 15
         trap ':' USR1
+        # Take over the lock from start only once a signal leads to cleanup.
+        printf '%s\n' "$$" > "$STATE/lock/owner"
         # Publish only after signal handlers exist. ready is the request handshake.
         printf '%s\n' "$$" > "$STATE/pid"
         bounded 3 lipc-get-prop com.lab126.powerd preventScreenSaver > "$STATE/saver-previous" || exit 1
@@ -259,29 +285,44 @@ case "$ACTION" in
             fi
             wanted=$REQUEST_ID
             rmdir "$STATE/request-lock"; trap - 0
-            owned_pid || { echo 'Worker stopped before request'; exit 1; }
+            owned_pid || { echo 'The dashboard stopped before it could search. Try again.'; exit 1; }
+            echo 'The running dashboard is searching for the quota server (up to 3 minutes)...'
             kill -USR1 "$pid"
-            until_tick=$(($(tick) + 130))
+            until_tick=$(($(tick) + 190))
             while [ "$(tick)" -lt "$until_tick" ]; do
                 result=$(cat "$STATE/result" 2>/dev/null) || result=
-                case "$result" in "$wanted success") echo 'Rediscovered and refreshed'; exit 0;; "$wanted "*) echo "$result"; exit 1;; esac
-                owned_pid || { echo 'Worker stopped'; exit 1; }
+                # Success leaves the new frame on screen; text would be drawn over it.
+                case "$result" in "$wanted success") exit 0;; "$wanted "*) echo 'Not found, or no frame could be drawn. The dashboard keeps retrying.'; exit 1;; esac
+                owned_pid || { echo 'The dashboard stopped during the search.'; exit 1; }
                 sleep 1
             done
-            echo 'Request timed out'; exit 1
+            echo 'No result yet; the dashboard is still working.'; exit 1
         fi
-        mkdir "$STATE/lock" 2>/dev/null || { echo 'Dashboard already active or stale lock; do not remove blindly' >&2; exit 1; }
+        acquire_lock || { echo 'Another dashboard task is still running; try again in a moment.' >&2; exit 1; }
         trap cleanup 0
         trap 'exit 1' 1 2 15
         [ -x "$FBINK" ] || exit 1
         seconds=30; mode=--known-only
-        [ "$ACTION" != rediscover ] || { seconds=120; mode=--force; }
+        [ "$ACTION" != rediscover ] || { seconds=180; mode=--force; }
         network_begin "$seconds"
-        wifi_begin && refresh "$mode"
+        # These lines reach the screen for the manual search. Nothing is printed
+        # after a frame has been drawn: text would land on top of it.
+        wifi_begin || { echo 'No Wi-Fi address. Connect to Wi-Fi and try again.'; exit 1; }
+        refresh "$mode" || { echo 'No new frame: the quota server was not found or did not send a valid image.'; exit 1; }
         ;;
     stop)
         : > "$STATE/stop"
-        if owned_pid; then kill "$pid"; else echo 'No verified dashboard process'; fi
+        if owned_pid; then
+            kill "$pid"
+        elif lock_holder_alive; then
+            # A one-off refresh or search, or a worker that is not ready yet.
+            kill "$holder"
+        else
+            # Nothing of ours is running: clear what a killed process left behind.
+            rm -f "$STATE/lock/owner" "$STATE/pid" "$STATE/ready"
+            rmdir "$STATE/lock" 2>/dev/null || true
+            echo 'No dashboard task was running.'
+        fi
         ;;
     status)
         if owned_pid; then printf 'running pid=%s\n' "$pid"; else printf 'not running\n'; fi

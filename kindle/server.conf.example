@@ -1,4 +1,5 @@
 # Parsed as data, never sourced as shell code. No quotes or inline comments.
+# One IPv4 address, or several separated by commas (for example home,office).
 SERVER_IP=
 SERVER_HOST=MacBook.local
 PORT=8486

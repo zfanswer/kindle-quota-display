@@ -33,8 +33,11 @@ def launchd(python, cli, output):
 
 
 def bundle(server, host, server_id, output):
-    if server:
-        ipaddress.IPv4Address(server)
+    addresses = server.split(",") if server else []
+    if len(addresses) > 8:
+        raise ValueError("at most eight server addresses")
+    for address in addresses:
+        ipaddress.IPv4Address(address)
     if host and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", host):
         raise ValueError("invalid hostname")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", server_id):
@@ -48,7 +51,7 @@ def bundle(server, host, server_id, output):
         (app / name).chmod(0o755)
     shutil.copyfile(ROOT / "kindle/assets/bootstrap-frame.png", app / "bootstrap-frame.png")
     config = (ROOT / "kindle/server.conf.example").read_text()
-    config = config.replace("SERVER_IP=\n", f"SERVER_IP={server}\n").replace("SERVER_HOST=MacBook.local", f"SERVER_HOST={host}")
+    config = config.replace("\nSERVER_IP=\n", f"\nSERVER_IP={server}\n").replace("SERVER_HOST=MacBook.local", f"SERVER_HOST={host}")
     config = config.replace("SERVER_ID=kqd-pw3", f"SERVER_ID={server_id}")
     (app / "server.conf").write_text(config)
     shutil.copytree(ROOT / "kindle/documents", output / "documents")
@@ -67,7 +70,7 @@ def main():
     launch.add_argument("--cli", type=Path, required=True)
     launch.add_argument("--output", type=Path, default=ROOT / "build/com.eink-quota.collector.plist")
     kindle = commands.add_parser("kindle")
-    kindle.add_argument("--server", default="")
+    kindle.add_argument("--server", default="", help="server IPv4 address, or up to eight separated by commas")
     kindle.add_argument("--host", default="MacBook.local")
     kindle.add_argument("--server-id", default="kqd-pw3")
     kindle.add_argument("--output", type=Path, default=ROOT / "build/kindle")

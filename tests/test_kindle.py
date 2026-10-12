@@ -127,7 +127,102 @@ case "$*" in */frame.png) exit 1;; *) exit 0;; esac''')
         self.command("ip", "printf '    inet 10.23.8.52/24 brd 10.23.8.255 scope global wlan0\\n'")
         result = self.run_script("find-server.sh", "--internal", "--force")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.base / "server.cache").read_text().strip(), "10.23.8.9")
+        # The new network's address goes first; the old network is remembered for the way back.
+        self.assertEqual((self.base / "server.cache").read_text().split(), ["10.23.8.9", "192.168.1.200"])
+        self.assertIn(b"Found the quota server at 10.23.8.9", result.stderr)
+
+    def test_every_usual_network_is_remembered_and_probed_together(self):
+        self.conf(ip="192.168.1.9,192.168.31.7")
+        (self.base / "server.cache").write_text("10.20.3.60\n172.16.5.5\n192.168.1.9\nnot a host\n")
+        self.env["MOCK_HOST"] = "172.16.5.5"
+        self.command("curl", 'for a; do case "$a" in http://*) printf "%s\n" "$a" >> "$MOCK_LOG";; esac; done\n'
+                     + (self.bin / "curl").read_text().removeprefix("#!/bin/sh\n"))
+        result = self.run_script("find-server.sh", "--internal", "--known-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b"172.16.5.5")
+        self.assertEqual(result.stderr, b"")  # automatic rounds stay silent
+        hosts = sorted(url.split("/")[2].split(":")[0] for url in self.log.read_text().splitlines())
+        self.assertEqual(hosts, ["10.20.3.60", "172.16.5.5", "192.168.1.9", "192.168.31.7"])
+        # The one that answered moves to the front; nothing is forgotten, junk is dropped.
+        self.assertEqual((self.base / "server.cache").read_text().split(), ["172.16.5.5", "10.20.3.60", "192.168.1.9"])
+
+    def test_known_address_list_is_bounded_and_strict(self):
+        (self.base / "server.cache").write_text("".join(f"10.0.0.{n}\n" for n in range(1, 9)))
+        result = subprocess.run(["/bin/sh", "-c", '. "$KQD_BASE/common.sh"; save_server 10.0.9.9'], env=self.env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.base / "server.cache").read_text().split(), ["10.0.9.9"] + [f"10.0.0.{n}" for n in range(1, 8)])
+        for value, ok in (("192.168.1.9,10.0.0.5", True), ("192.168.1.9,", False), ("192.168.1.9,,10.0.0.5", False),
+                          ("192.168.1.9 10.0.0.5", False), ("192.168.1.999", False), (",".join(["10.0.0.1"] * 9), False)):
+            self.conf(ip=value)
+            with self.subTest(value=value):
+                self.assertEqual(self.run_script("quota-dashboard.sh", "status").returncode == 0, ok)
+        self.conf()
+
+    def test_scan_starts_with_this_and_known_neighbourhoods(self):
+        # Device in 10.20.2.x/22; a server was once seen at 10.20.1.7, so 10.20.1.x is scanned
+        # right after the device's own /24 and before 10.20.0.x and 10.20.3.x.
+        self.conf(ip="")
+        (self.base / "server.cache").write_text("10.20.1.7\n192.168.1.9\n")
+        self.env["MOCK_HOST"] = "10.20.1.250"
+        self.command("ip", "printf '    inet 10.20.2.52/22 scope global wlan0\n'")
+        self.command("curl", 'for a; do case "$a" in http://*) printf "%s\n" "$a" >> "$MOCK_LOG";; esac; done\n'
+                     + (self.bin / "curl").read_text().removeprefix("#!/bin/sh\n"))
+        result = self.run_script("find-server.sh", "--internal", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b"10.20.1.250")
+        thirds = {url.split("/")[2].split(".")[2] for url in self.log.read_text().splitlines() if "//10.20." in url}
+        # The batch that finds it may spill a few addresses into the remainder, never as far as .3.x.
+        self.assertLessEqual({"1", "2"}, thirds)
+        self.assertNotIn("3", thirds)
+        self.assertIn(b"Scanning 1021 addresses on 10.20.2.52/22", result.stderr)
+        self.assertIn(b"checked 256 of 1021", result.stderr)
+
+    def test_manual_search_explains_failure_and_draws_nothing(self):
+        self.conf(ip="192.168.1.200")
+        self.command("ip", "printf '    inet 172.20.10.18/28 scope global wlan0\n'")
+        self.command("curl", "exit 1")
+        result = self.run_script("quota-dashboard.sh", "rediscover")
+        self.assertNotEqual(result.returncode, 0)
+        shown = (result.stdout + result.stderr).decode()
+        for line in ("Trying 1 known address(es)...", "None of them answered.", "Scanning 13 addresses on 172.20.10.18/28",
+                     "Quota server not found: none of 13 addresses answered", "No new frame: the quota server was not found"):
+            self.assertIn(line, shown)
+        self.assertFalse(self.log.exists() and "fbink" in self.log.read_text())
+        self.command("ip", "exit 0")
+        (self.state / "uptime").write_text("100.00 0")
+        self.command("sleep", '''if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi
+now=$(cut -d. -f1 "$KQD_UPTIME"); printf '%s.00 0' "$((now + $1))" > "$KQD_UPTIME"''')
+        result = self.run_script("quota-dashboard.sh", "rediscover")
+        self.assertIn(b"No Wi-Fi address", result.stdout)
+
+    def test_manual_search_success_prints_nothing_after_the_frame(self):
+        result = self.run_script("quota-dashboard.sh", "rediscover")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue(result.stderr.rstrip().endswith(b"(saved)."))
+        self.assertTrue(self.log.read_text().rstrip().endswith("frame.next.png"))
+
+    def test_search_entry_shows_output_and_resumes_the_loop(self):
+        entry = (ROOT / "kindle/documents/Find Quota Server.sh").read_text()
+        self.assertNotIn("DontUseFBInk", entry)
+        self.assertNotIn("UseHooks", entry)
+        (self.base / "bootstrap.sh").write_text('#!/bin/sh\necho bootstrap-called >> "$KQD_STATE/entry"\n')
+        script = self.base / "find-entry.sh"
+        script.write_text(entry.replace("BASE=/mnt/us/eink-dashboard", f"BASE={self.base}"))
+        result = subprocess.run(["/bin/sh", str(script)], env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"Found the quota server at 192.168.1.9", result.stdout)
+        self.assertEqual((self.state / "entry").read_text(), "bootstrap-called\n")
+        self.assertEqual((self.base / "discovery.log").read_bytes(), result.stdout)
+        # A failed search explains itself, waits so it can be read, and does not start the loop.
+        (self.state / "entry").unlink()
+        self.command("curl", "exit 1")
+        self.command("ip", "printf '    inet 172.20.10.18/30 scope global wlan0\n'")
+        self.command("sleep", 'if [ "${KQD_WATCHDOG:-0}" = 1 ]; then exec /bin/sleep "$@"; fi; printf "sleep %s\n" "$1" >> "$MOCK_LOG"')
+        result = subprocess.run(["/bin/sh", str(script)], env=self.env, capture_output=True, timeout=30)
+        self.assertIn(b"Quota server not found", result.stdout)
+        self.assertFalse((self.state / "entry").exists())
+        self.assertIn("sleep 8", self.log.read_text())
 
     def test_large_and_public_network_never_scanned(self):
         self.conf(ip="")
@@ -251,7 +346,8 @@ exec /bin/sleep .02''')
                 for request in (one, two):
                     out, err = request.communicate(timeout=8)
                     self.assertEqual(request.returncode, 0, err)
-                    self.assertIn(b"Rediscovered and refreshed", out)
+                    # Nothing may be printed after the worker drew the frame.
+                    self.assertEqual(out, b"The running dashboard is searching for the quota server (up to 3 minutes)...\n")
             self.assertEqual((self.base / "server.cache").read_text().strip(), "192.168.1.9")
             self.assertIn("failures=0 next_delay=180", (self.base / "power.log").read_text())
             self.assertEqual(sum(line.endswith("frame.next.png") for line in self.log.read_text().splitlines()), 1)
@@ -325,9 +421,94 @@ exec /bin/sleep .02''')
         self.assertEqual((self.state / "frame.png").read_bytes(), b"last good cache")
 
     def test_active_lock_prevents_overlapping_refresh(self):
+        # The lock names a live process of this project: nothing else may start.
+        proc = self.state / "proc"
+        (proc / "4242").mkdir(parents=True)
+        (proc / "4242/cmdline").write_text(f"/bin/sh {self.base}/quota-dashboard.sh rediscover")
+        self.env["KQD_PROC_ROOT"] = str(proc)
         (self.state / "lock").mkdir()
-        self.assertNotEqual(self.run_script("quota-dashboard.sh", "refresh").returncode, 0)
+        (self.state / "lock/owner").write_text("4242\n")
+        result = self.run_script("quota-dashboard.sh", "refresh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"still running", result.stderr)
         self.assertFalse(self.log.exists())
+        self.assertEqual((self.state / "lock/owner").read_text(), "4242\n")
+
+    def test_lock_left_by_a_killed_process_is_reclaimed(self):
+        proc = self.state / "proc"
+        (proc / "4242").mkdir(parents=True)
+        (proc / "4242/cmdline").write_text("/usr/bin/some-other-program")
+        self.env["KQD_PROC_ROOT"] = str(proc)
+        # No owner recorded, an owner that no longer exists, and a PID reused by another program.
+        for owner in (None, "999999\n", "4242\n"):
+            with self.subTest(owner=owner):
+                (self.state / "lock").mkdir()
+                if owner:
+                    (self.state / "lock/owner").write_text(owner)
+                (self.state / "frame.png").unlink(missing_ok=True)
+                result = self.run_script("quota-dashboard.sh", "refresh")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.state / "frame.png").read_bytes(), self.png.read_bytes())
+                self.assertFalse((self.state / "lock").exists())
+
+    def test_stop_also_ends_a_one_off_search_and_clears_leftovers(self):
+        proc = self.state / "proc"
+        proc.mkdir()
+        self.env["KQD_PROC_ROOT"] = str(proc)
+        self.command("curl", 'echo $$ > "$KQD_STATE/http-child"; exec /bin/sleep 30')
+        search = subprocess.Popen(["/bin/sh", str(self.base / "quota-dashboard.sh"), "rediscover"], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.state / "http-child").exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual((self.state / "lock/owner").read_text().strip(), str(search.pid))
+            (proc / str(search.pid)).mkdir()
+            (proc / str(search.pid) / "cmdline").write_text(f"/bin/sh {self.base}/quota-dashboard.sh rediscover")
+            child = int((self.state / "http-child").read_text())
+            self.assertEqual(self.run_script("quota-dashboard.sh", "stop").returncode, 0)
+            search.wait(timeout=5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+        finally:
+            if search.poll() is None:
+                search.kill()
+            search.communicate()
+        self.assertFalse((self.state / "lock").exists())
+        # With nothing running, stop removes a lock, PID and ready file that a killed process left.
+        (self.state / "lock").mkdir()
+        (self.state / "lock/owner").write_text("999999\n")
+        (self.state / "pid").write_text("999999\n")
+        (self.state / "ready").write_text("999999\n")
+        result = self.run_script("quota-dashboard.sh", "stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"No dashboard task was running", result.stdout)
+        for name in ("lock", "pid", "ready"):
+            self.assertFalse((self.state / name).exists(), name)
+        self.assertTrue((self.state / "stop").exists())
+
+    def test_worker_killed_without_cleanup_does_not_block_the_next_start(self):
+        # Entering USB drive mode kills the worker outright.
+        self.command("curl", 'exec /bin/sleep 30')
+        worker = self.start_visible_worker()
+        self.assertEqual((self.state / "lock/owner").read_text().strip(), str(worker.pid))
+        worker.kill()
+        worker.wait(timeout=4)
+        shutil.rmtree(self.state / "proc" / str(worker.pid))
+        self.assertTrue((self.state / "lock").exists())
+        self.command("curl", """output=; url=
+while [ "$#" -gt 0 ]; do
+ case "$1" in -o) output=$2; shift;; http://*) url=$1;; esac
+ shift
+done
+case "$url" in
+ http://$MOCK_HOST:8486/healthz) printf 'EINK_QUOTA_V1\\nSERVER_ID=kqd-pw3\\n' > "$output";;
+ http://$MOCK_HOST:8486/frame/kindle1.png) cp "$MOCK_PNG" "$output";;
+ *) exit 1;;
+esac""")
+        result = self.run_script("quota-dashboard.sh", "rediscover")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "lock").exists())
 
     def test_bootstrap_offline_shows_latest_cache_before_wifi(self):
         # A newer good frame exists while the installation snapshot is stale.

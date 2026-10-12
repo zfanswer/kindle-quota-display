@@ -443,6 +443,17 @@ esac
                 with self.subTest(expected=expected), self.assertRaisesRegex(CollectionError, expected):
                     run_cli(str(exe), "codex", 0.1 if expected == "timeout" else 3)
 
+    def test_prepared_bundle_accepts_several_server_addresses(self):
+        (ROOT / "build").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+            def prepare(name, servers):
+                return subprocess.run([sys.executable, str(ROOT / "scripts/prepare.py"), "kindle", "--server", servers,
+                                       "--output", str(Path(tmp) / name)], capture_output=True)
+            self.assertEqual(prepare("two", "192.168.1.50,10.0.0.8").returncode, 0)
+            self.assertIn("\nSERVER_IP=192.168.1.50,10.0.0.8\n", (Path(tmp) / "two/eink-dashboard/server.conf").read_text())
+            self.assertNotEqual(prepare("bad", "192.168.1.50,nope").returncode, 0)
+            self.assertNotEqual(prepare("many", ",".join(["10.0.0.1"] * 9)).returncode, 0)
+
     def test_prepare_cannot_install_outside_project(self):
         result = subprocess.run(["python3", str(ROOT / "scripts/prepare.py"), "kindle", "--output", "/tmp/should-not-install"], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
